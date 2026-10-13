@@ -11,7 +11,7 @@
 set -e
 
 FUNCTION_NAME="uk-train-delay-pipeline"
-REGION="eu-west-2"
+REGION="${AWS_REGION:-eu-west-2}"   # must match your bucket region
 BUCKET="${S3_BUCKET:-uk-train-delay-abu}"   # export S3_BUCKET=your-bucket-name
 RUNTIME="python3.12"
 ROLE_NAME="lambda-train-delay-role"
@@ -64,12 +64,18 @@ cp lambda/lambda_function.py $BUILD_DIR/
 
 # Install dependencies into the build dir
 # Lambda runs Linux x86_64 -- download Linux wheels, NOT Mac ones
-pip install pandas openpyxl odfpy \
+pip install pandas openpyxl \
     --target $BUILD_DIR \
     --platform manylinux2014_x86_64 \
     --implementation cp \
     --python-version 3.12 \
     --only-binary=:all: \
+    --quiet \
+    --no-cache-dir
+
+# odfpy is pure Python (no wheel on PyPI) -- safe to install without platform flags
+pip install odfpy \
+    --target $BUILD_DIR \
     --quiet \
     --no-cache-dir
 
