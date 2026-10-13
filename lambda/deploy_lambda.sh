@@ -12,7 +12,7 @@ set -e
 
 FUNCTION_NAME="uk-train-delay-pipeline"
 REGION="eu-west-2"
-BUCKET="uk-train-delay-abu"        # ← change to your bucket name
+BUCKET="${S3_BUCKET:-uk-train-delay-abu}"   # export S3_BUCKET=your-bucket-name
 RUNTIME="python3.12"
 ROLE_NAME="lambda-train-delay-role"
 
@@ -63,8 +63,13 @@ rm -rf $BUILD_DIR && mkdir -p $BUILD_DIR
 cp lambda/lambda_function.py $BUILD_DIR/
 
 # Install dependencies into the build dir
-pip install pandas openpyxl odfpy boto3 \
+# Lambda runs Linux x86_64 -- download Linux wheels, NOT Mac ones
+pip install pandas openpyxl odfpy \
     --target $BUILD_DIR \
+    --platform manylinux2014_x86_64 \
+    --implementation cp \
+    --python-version 3.12 \
+    --only-binary=:all: \
     --quiet \
     --no-cache-dir
 
@@ -73,6 +78,8 @@ cd $BUILD_DIR
 zip -r /tmp/lambda_package.zip . -x "*.pyc" -x "__pycache__/*" > /dev/null
 cd -
 echo "  Package size: $(du -sh /tmp/lambda_package.zip | cut -f1)"
+aws s3 cp /tmp/lambda_package.zip s3://$BUCKET/lambda/lambda_package.zip --region $REGION --only-show-errors
+echo "  Package uploaded to s3://$BUCKET/lambda/"
 
 # ── Step 3: Create or update the Lambda function ──────────────────────────────
 echo ""
@@ -88,9 +95,9 @@ if [ "$EXISTING" = "NOT_FOUND" ]; then
         --runtime $RUNTIME \
         --role $ROLE_ARN \
         --handler lambda_function.lambda_handler \
-        --zip-file fileb:///tmp/lambda_package.zip \
-        --timeout 300 \
-        --memory-size 512 \
+        --code S3Bucket=$BUCKET,S3Key=lambda/lambda_package.zip \
+        --timeout 900 \
+        --memory-size 2048 \
         --region $REGION \
         --environment "Variables={S3_BUCKET=$BUCKET,AWS_REGION_NAME=$REGION}" \
         --output text > /dev/null
@@ -99,7 +106,7 @@ else
     echo "  Updating existing function..."
     aws lambda update-function-code \
         --function-name $FUNCTION_NAME \
-        --zip-file fileb:///tmp/lambda_package.zip \
+        --s3-bucket $BUCKET --s3-key lambda/lambda_package.zip \
         --region $REGION \
         --output text > /dev/null
     echo "  Function updated."
