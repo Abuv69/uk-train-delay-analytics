@@ -5,3 +5,12 @@ __pycache__/
 *.db
 *.sqlite
 .env
+.env
+*.joblib
+__pycache__/
+.venv/
+*.pyc
+database/delays.db
+data/raw/
+data/processed/
+models/
