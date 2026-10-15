@@ -1,208 +1,128 @@
 # scripts/ml_model.py
-# Trains a Random Forest model to predict whether an operator will have
-# below-80% punctuality in the next quarter.
+# Predicts whether an operator's on-time % (3 min) will fall below 80% NEXT quarter.
+#
+# Honest evaluation:
+#   * TIME-BASED split: train on the past, test on later quarters (no random shuffling)
+#   * one-quarter embargo between train and test so no label leaks across the boundary
+#   * compared against naive baselines - a model that can't beat "same as this quarter"
+#     isn't adding value
+#
 # Run from the project root: python scripts/ml_model.py
 
-from pathlib import Path
+import json
 import sqlite3
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import sys
+from pathlib import Path
+
 import joblib
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score, f1_score, precision_score,
+                             recall_score, roc_auc_score)
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (classification_report, confusion_matrix,
-                              ConfusionMatrixDisplay, roc_curve, auc)
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from scripts.features import (CORE, FEATURES, THRESHOLD, build_feature_table,  # noqa: E402
+                              quarter_label)
 
-ROOT     = Path(__file__).resolve().parent.parent
-DB_PATH  = ROOT / "database" / "delays.db"
-VIS_DIR  = ROOT / "visuals"
+DB_PATH = ROOT / "database" / "delays.db"
 MODEL_DIR = ROOT / "models"
+VIS_DIR = ROOT / "visuals"
 
-THRESHOLD = 80.0   # below this = "delayed" (poor performance)
-
-
-def load_features(conn):
-    """
-    Join operator_punctuality + delay_causes to build a feature-rich table.
-    Returns a DataFrame ready for ML.
-    """
-    punct = pd.read_sql("""
-        SELECT operator, year, quarter, fin_year, pct_on_time_3m, recorded_stops
-        FROM operator_punctuality
-        WHERE pct_on_time_3m IS NOT NULL
-        ORDER BY operator, year, quarter
-    """, conn)
-
-    causes = pd.read_sql("""
-        SELECT operator, year_label AS fin_year, period_num,
-               total_delay_mins, nr_responsible_mins, toc_responsible_mins,
-               nr_severe_weather, toc_self_traincrew, toc_on_toc_traincrew
-        FROM delay_causes
-    """, conn)
-
-    # Aggregate causes to quarterly (13 periods ≈ 1 year, ~3.25 periods per quarter)
-    causes_q = causes.groupby(["operator", "fin_year"]).agg(
-        total_delay_mins     = ("total_delay_mins", "sum"),
-        nr_responsible_mins  = ("nr_responsible_mins", "sum"),
-        toc_responsible_mins = ("toc_responsible_mins", "sum"),
-        severe_weather_mins  = ("nr_severe_weather", "sum"),
-        traincrew_mins       = ("toc_self_traincrew", "sum"),
-    ).reset_index()
-
-    df = punct.merge(causes_q, on=["operator", "fin_year"], how="left")
-
-    # ── Feature engineering ──────────────────────────────────────────────────
-    df = df.sort_values(["operator", "year", "quarter"]).reset_index(drop=True)
-
-    # Lag features: last quarter's punctuality
-    df["lag1_pct"] = df.groupby("operator")["pct_on_time_3m"].shift(1)
-    df["lag2_pct"] = df.groupby("operator")["pct_on_time_3m"].shift(2)
-    df["lag4_pct"] = df.groupby("operator")["pct_on_time_3m"].shift(4)  # same Q, last year
-
-    # Rolling 4-quarter average
-    df["roll4_pct"] = df.groupby("operator")["pct_on_time_3m"].transform(
-        lambda x: x.shift(1).rolling(4, min_periods=2).mean()
-    )
-
-    # Trend: slope over last 4 quarters
-    def trend(series, n=4):
-        vals = series.shift(1).rolling(n, min_periods=n).apply(
-            lambda x: np.polyfit(range(len(x)), x, 1)[0], raw=True
-        )
-        return vals
-
-    df["trend_4q"] = df.groupby("operator")["pct_on_time_3m"].transform(trend)
-
-    # Seasonality: quarter dummies
-    df["is_q1"] = (df["quarter"] == "Q1").astype(int)
-    df["is_q2"] = (df["quarter"] == "Q2").astype(int)
-    df["is_q3"] = (df["quarter"] == "Q3").astype(int)
-    df["is_q4"] = (df["quarter"] == "Q4").astype(int)
-
-    # Delay ratios (where available)
-    df["nr_delay_ratio"] = df["nr_responsible_mins"] / (df["total_delay_mins"] + 1)
-    df["severe_weather_ratio"] = df["severe_weather_mins"] / (df["total_delay_mins"] + 1)
-    df["traincrew_ratio"] = df["traincrew_mins"] / (df["total_delay_mins"] + 1)
-
-    # Encode operator
-    le = LabelEncoder()
-    df["operator_enc"] = le.fit_transform(df["operator"].fillna("Unknown"))
-
-    # Target: next quarter below threshold
-    df["target"] = (df.groupby("operator")["pct_on_time_3m"].shift(-1) < THRESHOLD).astype(int)
-
-    return df, le
+TRAIN_END = pd.Timestamp("2022-10-01")   # last training quarter start (its label = Jan-Mar 2023)
+TEST_START = pd.Timestamp("2023-04-01")  # first test quarter (one-quarter embargo in between)
 
 
-FEATURE_COLS = [
-    "lag1_pct", "lag2_pct", "lag4_pct", "roll4_pct", "trend_4q",
-    "is_q1", "is_q2", "is_q3", "is_q4",
-    "total_delay_mins", "nr_responsible_mins", "toc_responsible_mins",
-    "nr_delay_ratio", "severe_weather_ratio", "traincrew_ratio",
-    "operator_enc",
-]
+def scores(y, pred, proba):
+    return {
+        "roc_auc": round(float(roc_auc_score(y, proba)), 3),
+        "f1": round(float(f1_score(y, pred)), 3),
+        "precision": round(float(precision_score(y, pred, zero_division=0)), 3),
+        "recall": round(float(recall_score(y, pred)), 3),
+        "accuracy": round(float(accuracy_score(y, pred)), 3),
+    }
 
 
-def train_and_evaluate(conn):
-    print("[ML] Building features ...")
-    df, le = load_features(conn)
+def main():
+    if not DB_PATH.exists():
+        print("[ERROR] Database not found. Run load_to_sql.py first.")
+        sys.exit(1)
+    conn = sqlite3.connect(DB_PATH.as_posix())
+    df = build_feature_table(conn)
+    conn.close()
 
-    # Drop rows with any NaN in features or target
-    df_model = df[FEATURE_COLS + ["target"]].dropna()
-    if len(df_model) < 80:
-        print(f"[ML] Only {len(df_model)} usable rows after dropna — model may be weak.")
+    lab = df.dropna(subset=["target"] + CORE).copy()
+    medians = lab.loc[lab["qdate"] <= TRAIN_END, FEATURES].median().to_dict()
+    lab[FEATURES] = lab[FEATURES].fillna(pd.Series(medians))
 
-    X = df_model[FEATURE_COLS]
-    y = df_model["target"]
+    train = lab[lab["qdate"] <= TRAIN_END]
+    test = lab[lab["qdate"] >= TEST_START]
+    Xtr, ytr, Xte, yte = train[FEATURES], train["target"], test[FEATURES], test["target"]
 
-    print(f"[ML] Dataset: {len(X)} rows | class balance: {y.mean():.1%} 'underperforming'")
+    print(f"Train: {len(train)} rows up to {quarter_label(train.qdate.max())}  |  "
+          f"Test: {len(test)} rows {quarter_label(test.qdate.min())} → {quarter_label(test.qdate.max())}")
+    print(f"At-risk share  train {ytr.mean():.1%}  test {yte.mean():.1%}")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y if y.sum() >= 10 else None
-    )
+    results = {}
 
-    # ── Random Forest ──────────────────────────────────────────────────────
-    rf = RandomForestClassifier(
-        n_estimators=200, max_depth=6, min_samples_leaf=3,
-        class_weight="balanced", random_state=42, n_jobs=-1
-    )
-    rf.fit(X_train, y_train)
+    # Baseline 1: persistence - "next quarter will be at risk if THIS quarter was"
+    results["Baseline: same as this quarter"] = scores(
+        yte, (test["cur_pct"] < THRESHOLD).astype(int), 100 - test["cur_pct"])
+    # Baseline 2: seasonal - "same as this quarter last year"
+    results["Baseline: same quarter last year"] = scores(
+        yte, (test["seasonal_pct"] < THRESHOLD).astype(int), 100 - test["seasonal_pct"])
 
-    cv_scores = cross_val_score(rf, X, y, cv=5, scoring="f1")
-    print(f"[ML] Cross-val F1 scores: {cv_scores.round(3)} — mean={cv_scores.mean():.3f}")
+    lr = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced"))
+    lr.fit(Xtr, ytr)
+    results["Logistic regression"] = scores(yte, lr.predict(Xte), lr.predict_proba(Xte)[:, 1])
 
-    y_pred  = rf.predict(X_test)
-    y_proba = rf.predict_proba(X_test)[:, 1]
+    rf = RandomForestClassifier(n_estimators=400, max_depth=5, min_samples_leaf=5,
+                                class_weight="balanced", random_state=42, n_jobs=-1)
+    rf.fit(Xtr, ytr)
+    results["Random forest"] = scores(yte, rf.predict(Xte), rf.predict_proba(Xte)[:, 1])
 
-    print("\n[ML] Classification Report:")
-    print(classification_report(y_test, y_pred, target_names=["On track (≥80%)", "At risk (<80%)"]))
+    table = pd.DataFrame(results).T
+    print("\nTest-set results (future quarters only):")
+    print(table.to_string())
 
-    # ── ROC ───────────────────────────────────────────────────────────────
-    fpr, tpr, _ = roc_curve(y_test, y_proba)
-    roc_auc = auc(fpr, tpr)
+    # Final deployed model: logistic regression (simplest model that matched/beat the rest),
+    # refit on ALL labelled quarters
+    final = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced"))
+    final.fit(lab[FEATURES], lab["target"])
 
-    # ── Charts ────────────────────────────────────────────────────────────
-    VIS_DIR.mkdir(exist_ok=True)
-    fig = plt.figure(figsize=(16, 5))
-    gs  = gridspec.GridSpec(1, 3, figure=fig)
-
-    # Feature importance
-    ax1 = fig.add_subplot(gs[0])
-    importances = pd.Series(rf.feature_importances_, index=FEATURE_COLS).sort_values()
-    importances.plot.barh(ax=ax1, color="#185FA5")
-    ax1.set_title("Feature Importance", fontweight="bold")
-    ax1.set_xlabel("Mean decrease in impurity")
-
-    # Confusion matrix
-    ax2 = fig.add_subplot(gs[1])
-    cm = confusion_matrix(y_test, y_pred)
-    ConfusionMatrixDisplay(cm, display_labels=["On track", "At risk"]).plot(
-        ax=ax2, colorbar=False, cmap="Blues"
-    )
-    ax2.set_title("Confusion Matrix", fontweight="bold")
-
-    # ROC curve
-    ax3 = fig.add_subplot(gs[2])
-    ax3.plot(fpr, tpr, color="#A32D2D", lw=2, label=f"AUC = {roc_auc:.3f}")
-    ax3.plot([0, 1], [0, 1], "k--", lw=1)
-    ax3.set_xlabel("False Positive Rate")
-    ax3.set_ylabel("True Positive Rate")
-    ax3.set_title("ROC Curve", fontweight="bold")
-    ax3.legend(loc="lower right")
-
-    fig.suptitle(
-        f"ML Model — Predicting Underperformance (<{THRESHOLD}% on-time)\n"
-        f"Random Forest | CV F1 = {cv_scores.mean():.3f} | ROC AUC = {roc_auc:.3f}",
-        fontsize=11, fontweight="bold"
-    )
-    fig.tight_layout()
-    out = VIS_DIR / "7_ml_model_results.png"
-    fig.savefig(out.as_posix(), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"\n[ML] Chart saved → visuals/7_ml_model_results.png")
-
-    # Save model + encoder
     MODEL_DIR.mkdir(exist_ok=True)
-    joblib.dump(rf, MODEL_DIR / "rf_model.joblib")
-    joblib.dump(le, MODEL_DIR / "operator_encoder.joblib")
-    print(f"[ML] Model saved → models/rf_model.joblib")
+    joblib.dump({"model": final, "features": FEATURES, "medians": medians,
+                 "threshold": THRESHOLD}, MODEL_DIR / "risk_model.joblib")
 
-    return rf, le, FEATURE_COLS
+    coefs = lr.named_steps["logisticregression"].coef_[0]   # standardised -> comparable magnitudes
+    importances = dict(zip(FEATURES, [round(float(v), 3) for v in coefs]))
+    metrics = {
+        "task": f"Predict on-time % (3 min) below {THRESHOLD:.0f}% next quarter",
+        "train_rows": int(len(train)), "test_rows": int(len(test)),
+        "train_until": quarter_label(train.qdate.max()),
+        "test_from": quarter_label(test.qdate.min()), "test_to": quarter_label(test.qdate.max()),
+        "at_risk_share_test": round(float(yte.mean()), 3),
+        "results": results, "deployed_model": "Logistic regression", "coefficients": importances,
+        "deployed_model_trained_on": int(len(lab)),
+    }
+    (MODEL_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    VIS_DIR.mkdir(exist_ok=True)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
+    table[["roc_auc", "f1"]].plot.barh(ax=a1, color=["#185FA5", "#1D9E75"])
+    a1.set_title("Test on future quarters: model vs baselines", fontweight="bold")
+    a1.set_xlim(0, 1)
+    pd.Series(importances).sort_values().plot.barh(ax=a2, color="#185FA5")
+    a2.set_title("Logistic regression coefficients (standardised)", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig((VIS_DIR / "7_ml_model_results.png").as_posix(), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("\nSaved models/risk_model.joblib, models/metrics.json, visuals/7_ml_model_results.png")
 
 
 if __name__ == "__main__":
-    print("=" * 55)
-    print("UK Train Delay Analytics — ML Model")
-    print("=" * 55)
-    if not DB_PATH.exists():
-        print(f"[ERROR] Database not found. Run load_to_sql.py first.")
-        sys.exit(1)
-    conn = sqlite3.connect(DB_PATH.as_posix())
-    train_and_evaluate(conn)
-    conn.close()
-    print("\n✓ Done.")
+    main()

@@ -178,6 +178,10 @@ def clean_3130():
     df["year_label"] = df["period"].astype(str).str.extract(r"(Apr \d{4} to Mar \d{4})")
     df["period_num"] = df["period"].astype(str).str.extract(r"Period\s+(\d+)").astype(float)
 
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]   # empty junk columns
+    df["station"] = (df["station"].astype(str)
+                     .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
+
     out = OUT / "station_performance.csv"
     df.to_csv(out, index=False)
     print(f"[3130] Saved {len(df):,} rows → {out.relative_to(ROOT)}")
@@ -271,6 +275,28 @@ def clean_3133():
         lambda r: f"{r['year']}-{str(r['year']+1)[-2:]}" if r["quarter"] in ("Q1","Q2","Q3") else
                   f"{r['year']-1}-{str(r['year'])[-2:]}" if r["quarter"] == "Q4" else None, axis=1
     )
+
+    # ── Fixes (found while reviewing the live dashboard) ──────────────────
+    # 1. strip ORR footnote markers: "Lumo [note 3]" -> "Lumo"
+    df["operator"] = (df["operator"].astype(str)
+                      .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
+    # 2. provisional flag, then clean the period label ("Oct to Dec 2025 [p]")
+    df["provisional"] = df["period"].astype(str).str.contains(r"\[p\]")
+    df["period"] = (df["period"].astype(str)
+                    .str.replace(r"\s*\[\w+\]", "", regex=True).str.strip())
+    # 3. zero recorded stops = no service (e.g. Hull Trains in COVID), not 0% punctuality
+    if "recorded_stops" in df.columns:
+        df = df[df["recorded_stops"].fillna(0) > 0]
+    # 4. real quarter start date -> chronological sorting (Jan-Mar belongs to the PREVIOUS
+    #    financial year, so sorting by calendar year + Q label mis-orders quarters)
+    first_month = {"Q1": 4, "Q2": 7, "Q3": 10, "Q4": 1}
+    df = df.dropna(subset=["quarter", "year"])
+    df["qdate"] = pd.to_datetime(dict(year=df["year"].astype(int),
+                                      month=df["quarter"].map(first_month), day=1))
+    keep = [c for c in ["period", "operator", "recorded_stops", "pct_on_time_1m",
+                        "pct_on_time_3m", "pct_on_time_15m", "quarter", "year",
+                        "fin_year", "qdate", "provisional"] if c in df.columns]
+    df = df[keep].drop_duplicates(["operator", "period"], keep="last")
 
     out = OUT / "operator_punctuality.csv"
     df.to_csv(out, index=False)

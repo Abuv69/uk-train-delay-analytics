@@ -94,7 +94,7 @@ Free official data from [dataportal.orr.gov.uk](https://dataportal.orr.gov.uk):
 | Data cleaning | Python · pandas · openpyxl · odfpy |
 | Database | SQLite (V1) → Amazon RDS (V2) |
 | Analysis | pandas · matplotlib · seaborn |
-| Machine Learning | scikit-learn · Random Forest · joblib |
+| Machine Learning | scikit-learn · logistic regression · time-based validation |
 | Dashboard | Streamlit · Plotly |
 
 ---
@@ -110,7 +110,8 @@ uk-train-delay-analytics/
 │   ├── clean_data.py           ← Local cleaning pipeline
 │   ├── load_to_sql.py          ← Loads CSVs → SQLite
 │   ├── analysis.py             ← Generates 6 charts
-│   └── ml_model.py             ← Trains Random Forest model
+│   ├── features.py             ← Shared feature builder (training + dashboard)
+│   └── ml_model.py             ← Trains and evaluates the risk model
 ├── lambda/
 │   ├── lambda_function.py      ← AWS Lambda handler
 │   └── deploy_lambda.sh        ← One-command deploy script
@@ -118,7 +119,7 @@ uk-train-delay-analytics/
 │   └── streamlit_app.py        ← Interactive dashboard (6 pages)
 ├── data/                       ← Raw + processed files (gitignored, stored in S3)
 ├── database/delays.db          ← SQLite DB (committed so the dashboard runs out of the box)
-├── models/                     ← Trained Random Forest + encoder
+├── models/                     ← risk_model.joblib + metrics.json
 ├── visuals/                    ← 7 generated charts
 ├── requirements.txt
 └── README.md
@@ -176,23 +177,39 @@ After deploy, any new ORR file uploaded to `s3://your-bucket/raw/` automatically
 
 ---
 
-## 📈 Results
+## 📈 Key Findings (all computed from the data in this repo)
 
-![Top operators by delay](visuals/1_worst_operators.png)
+- **Network Rail causes about 61% of delay minutes**; the three biggest causes are network management, non-track assets and external events.
+- **Northern, Govia Thameslink and Great Western** have the most total delay minutes — but they also run the most trains, so the dashboard also shows delay per 1,000 stops for a fairer comparison.
+- **Rail is strongly seasonal:** since April 2022, Oct–Dec averages about 76% on-time (3 min) against 81–83% in other quarters.
+- **COVID cut delay minutes by more than half** (about 1.3M per 4-week period in 2019-20 versus 0.5M in 2020-21); they have since recovered to roughly 2019-20 levels.
+- **In Oct–Dec 2025**, Avanti West Coast (51.8%), CrossCountry and TransPennine Express were weakest, while c2c, Greater Anglia and Merseyrail were strongest at about 90%.
+
 ![Delay trend](visuals/2_delay_trend.png)
-![ML model results](visuals/7_ml_model_results.png)
+![Operator punctuality](visuals/5_operator_punctuality_trend.png)
 
 ---
 
-## 🤖 ML Model Results
+## 🤖 Risk Model
 
-| Metric | Score |
-|--------|-------|
-| Accuracy | **87%** |
-| ROC AUC | **0.944** |
-| CV F1 (5-fold) | **0.813** |
+**Question:** given a full quarter of data, will an operator's on-time % (within 3 min) fall **below 80%** next quarter?
 
-Predicts whether an operator will fall below 80% on-time punctuality next quarter using lag features, seasonality, and delay cause ratios.
+**Features:** the last four quarters of punctuality (including the current quarter), momentum, delay minutes per 1,000 stops, the share of delay from Network Rail / weather / traincrew, and which quarter is being predicted.
+
+**Evaluation (done properly):** trained on data up to Oct–Dec 2022, tested only on **future** quarters (Apr 2023 – Sep 2025, 240 operator-quarters), with a one-quarter gap so no labels leak.
+
+| Model | ROC AUC | F1 | Precision | Recall |
+|---|---|---|---|---|
+| Baseline: same as this quarter | 0.960 | 0.872 | 0.88 | 0.86 |
+| Baseline: same quarter last year | 0.986 | 0.924 | 0.90 | 0.94 |
+| Random forest | 0.981 | 0.922 | 0.88 | 0.97 |
+| **Logistic regression (deployed)** | 0.992 | 0.926 | 0.88 | 0.97 |
+
+**Honest reading:** rail punctuality is so seasonal that the simple baseline "same quarter last year" is already very strong. The model matches or slightly beats it, so it is a useful early-warning signal rather than a breakthrough. Probabilities are not calibrated and should be read as a ranking of risk, not exact odds.
+
+The dashboard's **Risk Predictor** page fills itself from the latest real data, ranks every operator, and has a what-if panel to test changes.
+
+![Model results](visuals/7_ml_model_results.png)
 
 ---
 

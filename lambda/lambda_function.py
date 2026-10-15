@@ -166,6 +166,26 @@ def clean_3133(bucket, key):
         else f"{r['year']-1}-{str(r['year'])[-2:]}"
         if r["quarter"] == "Q4" else None, axis=1
     )
+    # ── same fixes as scripts/clean_data.py (keep the two in sync) ──
+    for col in ["pct_on_time_1m", "pct_on_time_3m", "pct_on_time_15m", "recorded_stops"]:
+        if col in df.columns:
+            df[col] = df[col].apply(to_num)
+    df["operator"] = (df["operator"].astype(str)
+                      .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
+    df["provisional"] = df["period"].astype(str).str.contains(r"\[p\]")
+    df["period"] = (df["period"].astype(str)
+                    .str.replace(r"\s*\[\w+\]", "", regex=True).str.strip())
+    df = df[~df["period"].str.startswith("Time")]
+    if "recorded_stops" in df.columns:
+        df = df[df["recorded_stops"].fillna(0) > 0]
+    df = df.dropna(subset=["quarter", "year"])
+    first_month = {"Q1": 4, "Q2": 7, "Q3": 10, "Q4": 1}
+    df["qdate"] = pd.to_datetime(dict(year=df["year"].astype(int),
+                                      month=df["quarter"].map(first_month), day=1))
+    keep = [c for c in ["period", "operator", "recorded_stops", "pct_on_time_1m", "pct_on_time_3m",
+                        "pct_on_time_15m", "quarter", "year", "fin_year", "qdate", "provisional"]
+            if c in df.columns]
+    df = df[keep].drop_duplicates(["operator", "period"], keep="last")
     write_csv_to_s3(df, bucket, "processed/operator_punctuality.csv")
 
 
@@ -200,6 +220,9 @@ def clean_3130(bucket, key):
             df[col] = df[col].apply(to_num)
     df["year_label"] = df["period"].astype(str).str.extract(r"(Apr \d{4} to Mar \d{4})")
     df["period_num"] = df["period"].astype(str).str.extract(r"Period\s+(\d+)").astype(float)
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    df["station"] = (df["station"].astype(str)
+                     .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
     write_csv_to_s3(df, bucket, "processed/station_performance.csv")
 
 

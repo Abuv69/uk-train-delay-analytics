@@ -1,451 +1,422 @@
 # app/streamlit_app.py
-# Interactive dashboard for UK Train Delay Analytics
-# Run from the project root: streamlit run app/streamlit_app.py
+# UK Train Delay Analytics dashboard.  Run: streamlit run app/streamlit_app.py
 
-from pathlib import Path
+import json
 import sqlite3
-import pandas as pd
+import sys
+from contextlib import closing
+from pathlib import Path
+
+import joblib
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import joblib
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH   = ROOT / "database" / "delays.db"
-MODEL_DIR = ROOT / "models"
+sys.path.insert(0, str(ROOT))
+from scripts.features import (FEATURES, THRESHOLD, build_feature_table,  # noqa: E402
+                              next_quarter_start, quarter_label)
 
-st.set_page_config(
-    page_title="UK Train Delay Analytics",
-    page_icon="🚂",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+DB_PATH = ROOT / "database" / "delays.db"
+MODEL_PATH = ROOT / "models" / "risk_model.joblib"
+METRICS_PATH = ROOT / "models" / "metrics.json"
 
-# ── Styling ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .metric-card {
-        background: #f8f9fa; border-radius: 10px;
-        padding: 1rem 1.2rem; border: 1px solid #e0e0e0;
-    }
-    .metric-value { font-size: 2rem; font-weight: 600; color: #185FA5; }
-    .metric-label { font-size: 0.85rem; color: #555; margin-top: 2px; }
-    .section-header { font-size: 1.1rem; font-weight: 600;
-                       color: #2c3e50; margin: 1.2rem 0 0.4rem; }
-</style>
-""", unsafe_allow_html=True)
+BLUE, TEAL, AMBER, RED = "#4C8BF5", "#1D9E75", "#E3A008", "#E5484D"
+
+st.set_page_config(page_title="UK Train Delay Analytics", page_icon="🚂",
+                   layout="wide", initial_sidebar_state="expanded")
+
+if not DB_PATH.exists():
+    st.error("Database not found. Run `python scripts/load_to_sql.py` first.")
+    st.stop()
 
 
-@st.cache_resource
-def get_conn():
-    if not DB_PATH.exists():
-        return None
-    return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
+# ── Data loading (cached) ─────────────────────────────────────────────────────
+def _query(sql, **kw):
+    with closing(sqlite3.connect(DB_PATH.as_posix())) as conn:
+        return pd.read_sql(sql, conn, **kw)
 
 
 @st.cache_data
-def load_delay_causes():
-    conn = get_conn()
-    if conn is None: return pd.DataFrame()
-    return pd.read_sql("SELECT * FROM delay_causes", conn)
+def load_causes():
+    d = _query("SELECT * FROM delay_causes")
+    d["period_start"] = (pd.to_datetime(d["start_year"].astype(int).astype(str) + "-04-01")
+                         + pd.to_timedelta((d["period_num"] - 1) * 28, unit="D"))
+    return d
 
 
 @st.cache_data
-def load_punctuality():
-    conn = get_conn()
-    if conn is None: return pd.DataFrame()
-    return pd.read_sql("SELECT * FROM operator_punctuality WHERE pct_on_time_3m IS NOT NULL", conn)
+def load_punct():
+    return _query("SELECT * FROM operator_punctuality WHERE pct_on_time_3m IS NOT NULL",
+                  parse_dates=["qdate"]).sort_values(["operator", "qdate"])
 
 
 @st.cache_data
 def load_stations():
-    conn = get_conn()
-    if conn is None: return pd.DataFrame()
-    return pd.read_sql("""
-        SELECT station,
-               AVG(time_to_3_pct) AS avg_time_to_3,
-               AVG(cancellations_pct) AS avg_cancellations,
-               SUM(scheduled_stops) AS total_scheduled
-        FROM station_performance
-        WHERE time_to_3_pct IS NOT NULL
-        GROUP BY station
-        HAVING total_scheduled >= 2000
-    """, conn)
+    d = _query("""SELECT period, station, scheduled_stops, time_to_3_pct, cancellations_pct,
+                         year_label, period_num FROM station_performance""")
+    start = d["year_label"].str.extract(r"Apr (\d{4})")[0].astype(float)
+    d["period_start"] = (pd.to_datetime(start.astype("Int64").astype(str) + "-04-01", errors="coerce")
+                         + pd.to_timedelta((d["period_num"] - 1) * 28, unit="D"))
+    return d
 
 
-def load_model():
-    rf_path  = MODEL_DIR / "rf_model.joblib"
-    enc_path = MODEL_DIR / "operator_encoder.joblib"
-    if rf_path.exists() and enc_path.exists():
-        return joblib.load(rf_path), joblib.load(enc_path)
-    return None, None
+@st.cache_data
+def load_features():
+    with closing(sqlite3.connect(DB_PATH.as_posix())) as conn:
+        return build_feature_table(conn)
+
+
+@st.cache_resource
+def load_bundle():
+    return joblib.load(MODEL_PATH) if MODEL_PATH.exists() else None
+
+
+def load_metrics():
+    return json.loads(METRICS_PATH.read_text()) if METRICS_PATH.exists() else None
+
+
+dc, pq, feats = load_causes(), load_punct(), load_features()
+latest_q = pq["qdate"].max()
+
+
+def wavg(g, col, w):
+    m = g[col].notna() & g[w].notna() & (g[w] > 0)
+    return (g.loc[m, col] * g.loc[m, w]).sum() / g.loc[m, w].sum() if m.any() else np.nan
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🚂 UK Train Delays")
-    st.markdown("**Powered by ORR official data**")
-    st.markdown("---")
-    page = st.radio("Navigate", [
-        "📊 Overview",
-        "📉 Delay Causes",
-        "🏆 Operator Performance",
-        "🚉 Station Rankings",
-        "🤖 ML Predictor",
-        "🗃 Raw Data",
-    ])
+    st.caption("Official ORR data · Tables 3184, 3133, 3130")
+    page = st.radio("Navigate", ["📊 Overview", "📉 Delay Causes", "🏆 Operator Performance",
+                                 "🚉 Stations", "🤖 Risk Predictor", "🗃 Raw Data"])
+    st.divider()
+    st.caption(f"Punctuality data to **{quarter_label(latest_q)}**"
+               f"{' (provisional)' if pq.loc[pq.qdate == latest_q, 'provisional'].any() else ''}")
+    st.caption(f"Delay-cause data to **{dc['year_label'].max()}**")
 
-conn = get_conn()
-if conn is None:
-    st.error("⚠️ Database not found. Run `python scripts/load_to_sql.py` first.")
-    st.stop()
 
-dc = load_delay_causes()
-pq = load_punctuality()
-
-# ── PAGE: Overview ────────────────────────────────────────────────────────────
+# ═════════════════════════════ OVERVIEW ══════════════════════════════════════
 if page == "📊 Overview":
-    st.title("UK Train Delay Analytics Dashboard")
-    st.caption("Official ORR data — Table 3184, 3133, 3130 · April 2019 to present")
+    st.title("UK Train Delay Analytics")
+    st.caption("How reliable is UK rail, who is struggling, and why?")
 
-    # Sidebar filters
-    with st.sidebar:
-        all_ops = sorted(dc["operator"].dropna().unique()) if not dc.empty else []
-        sel_ops = st.multiselect("Filter operators", all_ops, default=[])
+    cur = pq[pq.qdate == latest_q]
+    prev_year = pq[pq.qdate == latest_q - pd.DateOffset(years=1)]
+    nat_now = wavg(cur, "pct_on_time_3m", "recorded_stops")
+    nat_prev = wavg(prev_year, "pct_on_time_3m", "recorded_stops")
+    last_fy = dc["year_label"].max()
+    fy_total = dc.loc[dc.year_label == last_fy, "total_delay_mins"].sum() / 1e6
 
-    dff = dc if not sel_ops else dc[dc["operator"].isin(sel_ops)]
-
-    # KPI cards
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f"""<div class='metric-card'>
-            <div class='metric-value'>{len(dc['operator'].unique()):,}</div>
-            <div class='metric-label'>Train Operators</div></div>""", unsafe_allow_html=True)
-    with c2:
-        total_d = dff["total_delay_mins"].sum() / 1e9
-        st.markdown(f"""<div class='metric-card'>
-            <div class='metric-value'>{total_d:.1f}B</div>
-            <div class='metric-label'>Total Delay Minutes</div></div>""", unsafe_allow_html=True)
-    with c3:
-        avg_pct = pq["pct_on_time_3m"].mean() if not pq.empty else 0
-        st.markdown(f"""<div class='metric-card'>
-            <div class='metric-value'>{avg_pct:.1f}%</div>
-            <div class='metric-label'>Avg On-Time (3 min)</div></div>""", unsafe_allow_html=True)
-    with c4:
-        years = dc["year_label"].nunique() if not dc.empty else 0
-        st.markdown(f"""<div class='metric-card'>
-            <div class='metric-value'>{years}</div>
-            <div class='metric-label'>Financial Years</div></div>""", unsafe_allow_html=True)
+    c1.metric("Operators (latest quarter)", f"{cur['operator'].nunique()}")
+    c2.metric(f"On time (3 min), {quarter_label(latest_q)}", f"{nat_now:.1f}%",
+              f"{nat_now - nat_prev:+.1f} pts vs a year earlier" if pd.notna(nat_prev) else None)
+    c3.metric(f"Delay minutes, {last_fy}", f"{fy_total:.1f}M")
+    c4.metric("Punctuality history", f"{pq.qdate.min().year}–{latest_q.year}")
+    st.caption("On-time % is weighted by each operator's recorded stops (national picture, not a simple average).")
 
-    st.markdown("---")
+    ops = sorted(dc["operator"].unique())
+    sel = st.multiselect("Filter delay charts by operator (optional)", ops)
+    dff = dc[dc.operator.isin(sel)] if sel else dc
 
-    # Delay over time
-    if not dff.empty:
-        trend = dff.groupby(["year_label", "period_num"])["total_delay_mins"].sum().reset_index()
-        trend["x"] = trend["year_label"] + " P" + trend["period_num"].astype(int).astype(str).str.zfill(2)
-        fig = px.area(trend, x="x", y="total_delay_mins",
-                      title="Total Delay Minutes per Period",
-                      labels={"total_delay_mins": "Delay (mins)", "x": "Period"},
-                      color_discrete_sequence=["#185FA5"])
-        fig.update_layout(xaxis_tickangle=-45, xaxis_nticks=20)
-        st.plotly_chart(fig, use_container_width=True)
+    trend = dff.groupby("period_start", as_index=False)["total_delay_mins"].sum()
+    fig = px.area(trend, x="period_start", y="total_delay_mins",
+                  title="Delay minutes per 4-week period",
+                  labels={"period_start": "", "total_delay_mins": "Delay minutes"})
+    fig.update_traces(line_color=BLUE)
+    fig.add_vrect(x0="2020-03-23", x1="2020-07-04", fillcolor=AMBER, opacity=0.2, line_width=0,
+                  annotation_text="COVID lockdown", annotation_position="top left")
+    st.plotly_chart(fig)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if not dff.empty:
-            top10 = dff.groupby("operator")["total_delay_mins"].sum().nlargest(10).reset_index()
-            fig2 = px.bar(top10, x="total_delay_mins", y="operator", orientation="h",
-                          title="Top 10 Operators — Total Delay",
-                          labels={"total_delay_mins": "Minutes", "operator": ""},
-                          color_discrete_sequence=["#A32D2D"])
-            fig2.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig2, use_container_width=True)
-
-    with col_b:
-        if not pq.empty:
-            latest_pq = pq.sort_values("year").groupby("operator").tail(4)
-            avg_latest = latest_pq.groupby("operator")["pct_on_time_3m"].mean().reset_index()
-            avg_latest = avg_latest.sort_values("pct_on_time_3m", ascending=True)
-            color_vals = ["#A32D2D" if v < 80 else "#1D9E75" for v in avg_latest["pct_on_time_3m"]]
-            fig3 = go.Figure(go.Bar(
-                x=avg_latest["pct_on_time_3m"],
-                y=avg_latest["operator"],
-                orientation="h",
-                marker_color=color_vals,
-            ))
-            fig3.add_vline(x=80, line_dash="dash", line_color="#BA7517",
-                           annotation_text="80% target")
-            fig3.update_layout(title="Recent On-Time % (last 4 quarters)",
-                               xaxis_title="% On Time (3 min)",
-                               yaxis_title="", xaxis_range=[60, 100])
-            st.plotly_chart(fig3, use_container_width=True)
+    t1, t2 = st.tabs(["Operators by on-time %", "Operators by delay"])
+    with t1:
+        last4 = sorted(pq.qdate.unique())[-4:]
+        r = (pq[pq.qdate.isin(last4)].groupby("operator", as_index=False)["pct_on_time_3m"].mean()
+             .sort_values("pct_on_time_3m"))
+        r["status"] = np.where(r.pct_on_time_3m < THRESHOLD, "Below 80%", "80% or better")
+        fig = px.bar(r, x="pct_on_time_3m", y="operator", orientation="h", color="status",
+                     color_discrete_map={"Below 80%": RED, "80% or better": TEAL},
+                     title=f"Average on-time % (3 min), last 4 quarters to {quarter_label(latest_q)}",
+                     labels={"pct_on_time_3m": "% on time", "operator": "", "status": ""}, height=620)
+        fig.update_yaxes(dtick=1)
+        fig.update_xaxes(range=[50, 100])
+        fig.add_vline(x=THRESHOLD, line_dash="dash", line_color=AMBER)
+        st.plotly_chart(fig)
+    with t2:
+        mode = st.radio("Measure", ["Total delay minutes", "Delay minutes per 1,000 stops (fairer)"],
+                        horizontal=True)
+        if mode.startswith("Total"):
+            r = dff.groupby("operator", as_index=False)["total_delay_mins"].sum()
+            r = r.nlargest(12, "total_delay_mins").sort_values("total_delay_mins")
+            fig = px.bar(r, x="total_delay_mins", y="operator", orientation="h",
+                         title="Top 12 operators by total delay minutes (all years)",
+                         labels={"total_delay_mins": "Minutes", "operator": ""}, height=480)
+            fig.update_traces(marker_color=RED)
+            st.plotly_chart(fig)
+            st.caption("⚠️ Big operators run more trains, so they naturally accumulate more delay minutes. "
+                       "Use the per-1,000-stops view for a fair comparison.")
+        else:
+            f4 = feats[feats.qdate.isin(last4)].dropna(subset=["total_delay_mins", "recorded_stops"])
+            r = (f4.groupby("operator").apply(
+                lambda g: g.total_delay_mins.sum() / g.recorded_stops.sum() * 1000, include_groups=False)
+                .rename("per_1k").reset_index().sort_values("per_1k").tail(12))
+            fig = px.bar(r, x="per_1k", y="operator", orientation="h",
+                         title="Delay minutes per 1,000 recorded stops, last 4 quarters",
+                         labels={"per_1k": "Delay mins per 1,000 stops", "operator": ""}, height=480)
+            fig.update_traces(marker_color=AMBER)
+            st.plotly_chart(fig)
+            st.caption("Long-distance and sleeper services make few stops per journey, so they look worse on "
+                       "this measure than commuter operators.")
 
 
-# ── PAGE: Delay Causes ────────────────────────────────────────────────────────
+# ═════════════════════════════ DELAY CAUSES ══════════════════════════════════
 elif page == "📉 Delay Causes":
-    st.title("Delay Causes Analysis")
-
-    with st.sidebar:
-        all_ops = sorted(dc["operator"].dropna().unique())
-        sel_op  = st.selectbox("Operator", ["All"] + all_ops)
-        all_years = sorted(dc["year_label"].dropna().unique())
-        sel_year  = st.selectbox("Financial Year", ["All"] + all_years)
-
-    dff = dc.copy()
-    if sel_op != "All":   dff = dff[dff["operator"] == sel_op]
-    if sel_year != "All": dff = dff[dff["year_label"] == sel_year]
-
-    CAUSE_MAP = {
-        "nr_external": "NR External",
-        "nr_network_mgmt": "NR Network Mgmt",
-        "nr_non_track_assets": "NR Non-Track Assets",
-        "nr_severe_weather": "NR Severe Weather",
-        "nr_track": "NR Track",
-        "toc_self_fleet": "TOC Fleet",
-        "toc_self_operations": "TOC Operations",
-        "toc_self_stations": "TOC Stations",
-        "toc_self_traincrew": "TOC Traincrew",
-        "toc_self_other": "TOC Other",
-        "toc_on_toc_fleet": "TOC-on-TOC Fleet",
-        "toc_on_toc_operations": "TOC-on-TOC Ops",
-        "toc_on_toc_stations": "TOC-on-TOC Stations",
-        "toc_on_toc_traincrew": "TOC-on-TOC Traincrew",
-        "toc_on_toc_other": "TOC-on-TOC Other",
-    }
-
-    cols_present = [c for c in CAUSE_MAP if c in dff.columns]
-    cause_totals = dff[cols_present].sum().rename(CAUSE_MAP)
-    cause_df = cause_totals.reset_index()
-    cause_df.columns = ["cause", "delay_mins"]
-    cause_df = cause_df.sort_values("delay_mins", ascending=False)
-    cause_df["responsible"] = cause_df["cause"].apply(lambda x: "Network Rail" if x.startswith("NR") else "TOC")
-
-    col1, col2 = st.columns([1.5, 1])
-    with col1:
-        fig = px.bar(cause_df, x="delay_mins", y="cause", orientation="h",
-                     color="responsible",
-                     color_discrete_map={"Network Rail": "#185FA5", "TOC": "#BA7517"},
-                     title="Delay Minutes by Cause",
-                     labels={"delay_mins": "Minutes", "cause": ""})
-        fig.update_layout(yaxis={"categoryorder": "total ascending"}, legend_title="Responsible")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        nr_total  = dff["nr_responsible_mins"].sum()
-        toc_total = dff["toc_responsible_mins"].sum()
-        fig2 = go.Figure(go.Pie(
-            labels=["Network Rail", "TOC (operators)"],
-            values=[nr_total, toc_total],
-            marker_colors=["#185FA5", "#BA7517"],
-            hole=0.4,
-        ))
-        fig2.update_layout(title="NR vs TOC Responsibility Split")
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # Year-on-year trend by cause category
+    st.title("Delay Causes")
+    f1, f2 = st.columns(2)
+    sel_op = f1.selectbox("Operator", ["All"] + sorted(dc.operator.unique()))
+    sel_year = f2.selectbox("Financial year", ["All"] + sorted(dc.year_label.unique()))
+    d = dc.copy()
     if sel_op != "All":
-        cause_yr = dff.groupby("year_label")[cols_present].sum().reset_index()
-        cause_yr_long = cause_yr.melt(id_vars="year_label", var_name="cause", value_name="mins")
-        cause_yr_long["cause"] = cause_yr_long["cause"].map(CAUSE_MAP)
-        fig3 = px.line(cause_yr_long, x="year_label", y="mins", color="cause",
-                       title=f"Delay Cause Trend — {sel_op}",
-                       labels={"mins": "Minutes", "year_label": "Financial Year"})
-        st.plotly_chart(fig3, use_container_width=True)
+        d = d[d.operator == sel_op]
+    if sel_year != "All":
+        d = d[d.year_label == sel_year]
+
+    CAUSES = {"nr_external": "NR External", "nr_network_mgmt": "NR Network Mgmt",
+              "nr_non_track_assets": "NR Non-Track Assets", "nr_severe_weather": "NR Severe Weather",
+              "nr_track": "NR Track", "toc_self_fleet": "TOC Fleet",
+              "toc_self_operations": "TOC Operations", "toc_self_stations": "TOC Stations",
+              "toc_self_traincrew": "TOC Traincrew", "toc_self_other": "TOC Other",
+              "toc_on_toc_fleet": "On-TOC Fleet", "toc_on_toc_operations": "On-TOC Ops",
+              "toc_on_toc_stations": "On-TOC Stations", "toc_on_toc_traincrew": "On-TOC Traincrew",
+              "toc_on_toc_other": "On-TOC Other"}
+    tot = d[list(CAUSES)].sum().rename(CAUSES).reset_index()
+    tot.columns = ["cause", "mins"]
+    tot["who"] = np.where(tot.cause.str.startswith("NR"), "Network Rail", "Train operators")
+    tot = tot.sort_values("mins")
+
+    a, b = st.columns([1.6, 1])
+    fig = px.bar(tot, x="mins", y="cause", orientation="h", color="who", height=520,
+                 color_discrete_map={"Network Rail": BLUE, "Train operators": AMBER},
+                 title="Delay minutes by cause", labels={"mins": "Minutes", "cause": "", "who": ""})
+    fig.update_yaxes(dtick=1)
+    a.plotly_chart(fig)
+    share = d[["nr_responsible_mins", "toc_responsible_mins"]].sum()
+    fig = go.Figure(go.Pie(labels=["Network Rail", "Train operators"],
+                           values=[share.nr_responsible_mins, share.toc_responsible_mins],
+                           hole=0.5, marker_colors=[BLUE, AMBER]))
+    fig.update_layout(title="Who is responsible?", height=520)
+    b.plotly_chart(fig)
+
+    yr = (dc if sel_op == "All" else dc[dc.operator == sel_op]).groupby("year_label")[
+        ["nr_responsible_mins", "toc_responsible_mins"]].sum().reset_index()
+    fig = px.bar(yr, x="year_label", y=["nr_responsible_mins", "toc_responsible_mins"],
+                 title=f"Delay minutes by year — {sel_op}",
+                 labels={"value": "Minutes", "year_label": "", "variable": ""})
+    fig.for_each_trace(lambda t: t.update(
+        name="Network Rail" if t.name.startswith("nr") else "Train operators",
+        marker_color=BLUE if t.name.startswith("nr") else AMBER))
+    st.plotly_chart(fig)
 
 
-# ── PAGE: Operator Performance ────────────────────────────────────────────────
+# ═════════════════════════ OPERATOR PERFORMANCE ══════════════════════════════
 elif page == "🏆 Operator Performance":
-    st.title("Operator Punctuality Performance")
+    st.title("Operator Performance")
+    st.caption("% of trains arriving within 3 minutes of schedule, per quarter.")
+    active = pq[pq.qdate == latest_q].nlargest(6, "recorded_stops")["operator"].tolist()
+    ops = st.multiselect("Operators", sorted(pq.operator.unique()), default=active)
+    d = pq[pq.operator.isin(ops)]
 
-    with st.sidebar:
-        all_ops = sorted(pq["operator"].dropna().unique()) if not pq.empty else []
-        sel_ops = st.multiselect("Select operators", all_ops,
-                                  default=all_ops[:6] if len(all_ops) >= 6 else all_ops)
-
-    dff = pq[pq["operator"].isin(sel_ops)] if sel_ops else pq
-
-    if not dff.empty:
-        dff = dff.copy()
-        dff["x"] = dff["year"].astype(str) + " " + dff["quarter"].astype(str)
-        dff = dff.sort_values(["operator", "year", "quarter"])
-
-        fig = px.line(dff, x="x", y="pct_on_time_3m", color="operator",
-                      title="Quarterly Punctuality — % trains on time (within 3 mins)",
-                      labels={"pct_on_time_3m": "% On Time (3 min)", "x": "Quarter"})
-        fig.add_hline(y=80, line_dash="dash", line_color="red",
-                      annotation_text="80% benchmark")
-        fig.update_layout(xaxis_tickangle=-45, xaxis_nticks=20)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # League table
-    st.subheader("League Table — Latest 4 Quarters")
-    if not pq.empty:
-        recent = pq.sort_values("year").groupby("operator").tail(4)
-        league = recent.groupby("operator").agg(
-            avg_pct=("pct_on_time_3m", "mean"),
-            min_pct=("pct_on_time_3m", "min"),
-            max_pct=("pct_on_time_3m", "max"),
-        ).reset_index().sort_values("avg_pct", ascending=False).reset_index(drop=True)
-        league.index += 1
-        league.columns = ["Operator", "Avg On-Time %", "Worst Quarter %", "Best Quarter %"]
-        league["Avg On-Time %"] = league["Avg On-Time %"].round(1)
-        league["Worst Quarter %"] = league["Worst Quarter %"].round(1)
-        league["Best Quarter %"]  = league["Best Quarter %"].round(1)
-
-        def color_row(val):
-            if isinstance(val, float):
-                if val >= 85: return "background-color: #d4edda"
-                elif val < 75: return "background-color: #f8d7da"
-            return ""
-
-        st.dataframe(league.style.map(color_row, subset=["Avg On-Time %"]),
-                     use_container_width=True, height=500)
+    t1, t2, t3 = st.tabs(["Trend", "Heatmap (last 12 quarters)", "League table"])
+    with t1:
+        fig = px.line(d, x="qdate", y="pct_on_time_3m", color="operator",
+                      labels={"qdate": "", "pct_on_time_3m": "% on time (3 min)", "operator": ""})
+        fig.add_hline(y=THRESHOLD, line_dash="dash", line_color=AMBER, annotation_text="80% line")
+        st.plotly_chart(fig)
+    with t2:
+        q12 = sorted(pq.qdate.unique())[-12:]
+        h = pq[pq.qdate.isin(q12)].pivot_table(index="operator", columns="qdate", values="pct_on_time_3m")
+        h.columns = [quarter_label(c) for c in h.columns]
+        h = h.loc[h.mean(axis=1).sort_values().index]
+        fig = px.imshow(h, color_continuous_scale="RdYlGn", zmin=60, zmax=100, aspect="auto",
+                        text_auto=".0f", height=max(420, 26 * len(h)),
+                        labels={"color": "% on time"})
+        fig.update_xaxes(side="top")
+        st.plotly_chart(fig)
+        st.caption("Notice the red columns: Oct–Dec is the worst quarter almost every year.")
+    with t3:
+        last4 = sorted(pq.qdate.unique())[-4:]
+        lg = (pq[pq.qdate.isin(last4)].groupby("operator")["pct_on_time_3m"]
+              .agg(avg="mean", worst="min", best="max", quarters="count").reset_index()
+              .sort_values("avg", ascending=False))
+        lg.columns = ["Operator", "Average %", "Worst quarter %", "Best quarter %", "Quarters"]
+        st.dataframe(lg, hide_index=True, column_config={
+            "Average %": st.column_config.ProgressColumn("Average %", min_value=50, max_value=100, format="%.1f"),
+            "Worst quarter %": st.column_config.NumberColumn(format="%.1f"),
+            "Best quarter %": st.column_config.NumberColumn(format="%.1f")})
+        st.caption(f"Last 4 quarters to {quarter_label(latest_q)}. Operators with fewer than 4 quarters are new or restarted.")
 
 
-# ── PAGE: Station Rankings ────────────────────────────────────────────────────
-elif page == "🚉 Station Rankings":
-    st.title("Station Performance Rankings")
+# ═════════════════════════════ STATIONS ══════════════════════════════════════
+elif page == "🚉 Stations":
+    st.title("Station Performance")
+    st0 = load_stations()
+    st.caption(f"Data covers {st0.period_start.min():%b %Y} to {st0.period_start.max():%b %Y}. "
+               "Averages are weighted by scheduled stops.")
+    min_stops = st.slider("Minimum scheduled stops (filters out tiny stations)", 1000, 100000, 10000, step=1000)
 
-    stations = load_stations()
-    if stations.empty:
-        st.warning("Station data not loaded. Make sure station_performance.csv was processed.")
-    else:
-        c1, c2 = st.columns([2, 1])
-        with c2:
-            min_stops = st.slider("Min scheduled stops", 2000, 50000, 5000, step=1000)
+    def agg(g):
+        return pd.Series({"punctuality": wavg(g, "time_to_3_pct", "scheduled_stops"),
+                          "cancellations": wavg(g, "cancellations_pct", "scheduled_stops"),
+                          "stops": g["scheduled_stops"].sum()})
+    s = st0.groupby("station").apply(agg, include_groups=False).reset_index()
+    s = s[(s.stops >= min_stops)].dropna(subset=["punctuality"])
 
-        dff = stations[stations["total_scheduled"] >= min_stops]
-
-        col1, col2 = st.columns(2)
-        with col1:
-            best = dff.nlargest(20, "avg_time_to_3")
-            fig = px.bar(best, x="avg_time_to_3", y="station", orientation="h",
-                         title="🏅 20 Best Stations (Time-to-3 %)",
-                         color="avg_time_to_3", color_continuous_scale="Greens",
-                         labels={"avg_time_to_3": "% On Time", "station": ""})
-            fig.update_layout(yaxis={"categoryorder": "total ascending"},
-                              coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            worst = dff.nsmallest(20, "avg_time_to_3")
-            fig2 = px.bar(worst, x="avg_time_to_3", y="station", orientation="h",
-                          title="🔴 20 Worst Stations (Time-to-3 %)",
-                          color="avg_time_to_3", color_continuous_scale="Reds_r",
-                          labels={"avg_time_to_3": "% On Time", "station": ""})
-            fig2.update_layout(yaxis={"categoryorder": "total ascending"},
-                               coloraxis_showscale=False)
-            st.plotly_chart(fig2, use_container_width=True)
-
-        st.subheader("Cancellation Rate — Top 20 worst")
-        worst_canc = dff.nlargest(20, "avg_cancellations")
-        fig3 = px.bar(worst_canc, x="avg_cancellations", y="station", orientation="h",
-                      color="avg_cancellations", color_continuous_scale="Oranges",
-                      labels={"avg_cancellations": "Cancellations %", "station": ""},
-                      title="Stations with Highest Cancellation Rates")
-        fig3.update_layout(yaxis={"categoryorder": "total ascending"},
-                           coloraxis_showscale=False)
-        st.plotly_chart(fig3, use_container_width=True)
-
-
-# ── PAGE: ML Predictor ────────────────────────────────────────────────────────
-elif page == "🤖 ML Predictor":
-    st.title("ML — Underperformance Predictor")
-    st.markdown(
-        "This model predicts the **probability that an operator will fall below "
-        "80% on-time punctuality next quarter**, using lag features, seasonality, "
-        "and delay cause data. Trained on ORR data (2014–2025)."
-    )
-
-    model, le = load_model()
-    if model is None:
-        st.warning("Model not found. Run `python scripts/ml_model.py` to train it.")
-        st.info("Once trained, the model file will appear in `models/rf_model.joblib`")
-    else:
-        # Show model results image if it exists
-        model_chart = ROOT / "visuals" / "7_ml_model_results.png"
-        if model_chart.exists():
-            st.image(str(model_chart), caption="Model evaluation results", use_container_width=True)
-
-        st.subheader("🎯 Live Prediction")
-        st.markdown("Fill in the values below to predict the risk for next quarter.")
-
-        all_ops = list(le.classes_)
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            sel_op  = st.selectbox("Operator", all_ops)
-            quarter = st.selectbox("Current Quarter", ["Q1", "Q2", "Q3", "Q4"])
-        with col2:
-            lag1 = st.slider("Last quarter on-time %", 60.0, 100.0, 82.0, step=0.5)
-            lag2 = st.slider("2 quarters ago on-time %", 60.0, 100.0, 81.0, step=0.5)
-        with col3:
-            lag4 = st.slider("Same Q last year on-time %", 60.0, 100.0, 83.0, step=0.5)
-            roll4 = st.slider("4-quarter rolling average %", 60.0, 100.0, 82.0, step=0.5)
-
-        col4, col5 = st.columns(2)
-        with col4:
-            total_delay = st.number_input("Total delay mins (this period)", 0, 5000000, 100000, step=10000)
-            nr_delay    = st.number_input("NR responsible delay mins", 0, 3000000, 50000, step=10000)
-        with col5:
-            toc_delay   = st.number_input("TOC responsible delay mins", 0, 3000000, 50000, step=10000)
-            weather_mins = st.number_input("Severe weather delay mins", 0, 500000, 5000, step=1000)
-
-        if st.button("🔮 Predict Next Quarter Risk", type="primary"):
-            nr_ratio = nr_delay / (total_delay + 1)
-            wx_ratio = weather_mins / (total_delay + 1)
-            tc_ratio = 0.1  # default traincrew ratio
-
-            features = pd.DataFrame([{
-                "lag1_pct": lag1, "lag2_pct": lag2, "lag4_pct": lag4,
-                "roll4_pct": roll4, "trend_4q": lag1 - lag4,
-                "is_q1": int(quarter == "Q1"), "is_q2": int(quarter == "Q2"),
-                "is_q3": int(quarter == "Q3"), "is_q4": int(quarter == "Q4"),
-                "total_delay_mins": total_delay,
-                "nr_responsible_mins": nr_delay,
-                "toc_responsible_mins": toc_delay,
-                "nr_delay_ratio": nr_ratio,
-                "severe_weather_ratio": wx_ratio,
-                "traincrew_ratio": tc_ratio,
-                "operator_enc": le.transform([sel_op])[0],
-            }])
-
-            prob = model.predict_proba(features)[0][1]
-            pred = prob >= 0.5
-
-            if pred:
-                st.error(f"⚠️ **AT RISK** — predicted probability of underperformance: **{prob:.1%}**")
-            else:
-                st.success(f"✅ **ON TRACK** — predicted probability of underperformance: **{prob:.1%}**")
-
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=prob * 100,
-                title={"text": "Risk Score (%)"},
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {"color": "#A32D2D" if pred else "#1D9E75"},
-                    "steps": [
-                        {"range": [0, 50], "color": "#d4edda"},
-                        {"range": [50, 75], "color": "#fff3cd"},
-                        {"range": [75, 100], "color": "#f8d7da"},
-                    ],
-                    "threshold": {"line": {"color": "black", "width": 4}, "value": 50},
-                },
-            ))
-            st.plotly_chart(fig, use_container_width=True)
+    t1, t2, t3 = st.tabs(["Punctuality", "Cancellations", "Station lookup"])
+    with t1:
+        c1, c2 = st.columns(2)
+        best = s.nlargest(20, "punctuality").sort_values("punctuality")
+        worst = s.nsmallest(20, "punctuality").sort_values("punctuality", ascending=False)
+        for col, data, title, colour in [(c1, best, "20 best — % arriving within 3 min", TEAL),
+                                         (c2, worst, "20 worst — % arriving within 3 min", RED)]:
+            fig = px.bar(data, x="punctuality", y="station", orientation="h", title=title,
+                         labels={"punctuality": "% on time", "station": ""}, height=640)
+            fig.update_traces(marker_color=colour)
+            fig.update_yaxes(dtick=1)
+            col.plotly_chart(fig)
+    with t2:
+        c = s.dropna(subset=["cancellations"]).nlargest(20, "cancellations").sort_values("cancellations")
+        fig = px.bar(c, x="cancellations", y="station", orientation="h", height=640,
+                     title="20 highest cancellation rates", labels={"cancellations": "% cancelled", "station": ""})
+        fig.update_traces(marker_color=AMBER)
+        fig.update_yaxes(dtick=1)
+        st.plotly_chart(fig)
+    with t3:
+        name = st.selectbox("Station", sorted(st0.station.unique()))
+        one = st0[st0.station == name].dropna(subset=["time_to_3_pct"]).sort_values("period_start")
+        if one.empty:
+            st.info("No punctuality data for this station.")
+        else:
+            fig = px.line(one, x="period_start", y="time_to_3_pct", markers=True,
+                          title=f"{name} — % arriving within 3 min by 4-week period",
+                          labels={"period_start": "", "time_to_3_pct": "% on time"})
+            fig.add_hline(y=THRESHOLD, line_dash="dash", line_color=AMBER)
+            st.plotly_chart(fig)
 
 
-# ── PAGE: Raw Data ────────────────────────────────────────────────────────────
+# ═════════════════════════════ RISK PREDICTOR ════════════════════════════════
+elif page == "🤖 Risk Predictor":
+    st.title("Risk Predictor")
+    bundle, metrics = load_bundle(), load_metrics()
+    if bundle is None:
+        st.warning("Model not found. Run `python scripts/ml_model.py`.")
+        st.stop()
+    model, medians = bundle["model"], bundle["medians"]
+    next_q = next_quarter_start(latest_q)
+    st.markdown(f"Will an operator's on-time % fall **below {THRESHOLD:.0f}%** in "
+                f"**{quarter_label(next_q)}**? Everything below is filled in automatically from the "
+                f"latest real data (**{quarter_label(latest_q)}**) — you can then test 'what-if' changes.")
+
+    def predict(row_df):
+        X = row_df[FEATURES].astype(float).fillna(pd.Series(medians))
+        return model.predict_proba(X)[:, 1]
+
+    latest = feats[feats.qdate == latest_q].dropna(subset=["cur_pct", "prev1_pct", "prev2_pct", "seasonal_pct"]).copy()
+    latest["risk"] = predict(latest)
+
+    tab_op, tab_all, tab_model = st.tabs(["Operator forecast", "All operators", "How good is it?"])
+
+    with tab_all:
+        t = latest[["operator", "cur_pct", "seasonal_pct", "risk"]].sort_values("risk", ascending=False)
+        t.columns = ["Operator", f"On time {quarter_label(latest_q)} %", "Same quarter last year %", "Risk next quarter"]
+        t["Risk next quarter"] = (t["Risk next quarter"] * 100).round(0)
+        st.dataframe(t, hide_index=True, column_config={
+            "Risk next quarter": st.column_config.ProgressColumn("Risk next quarter", min_value=0, max_value=100, format="%d%%"),
+            f"On time {quarter_label(latest_q)} %": st.column_config.NumberColumn(format="%.1f"),
+            "Same quarter last year %": st.column_config.NumberColumn(format="%.1f")})
+        st.caption("Operators without a full year of history are excluded.")
+
+    with tab_op:
+        ordered = latest.sort_values("risk", ascending=False)["operator"].tolist()
+        op = st.selectbox("Operator", ordered)
+        row = latest[latest.operator == op].iloc[0]
+        base = float(row["risk"])
+
+        g1, g2 = st.columns([1, 1.4])
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number", value=base * 100, number={"suffix": "%"},
+            title={"text": f"Risk of <{THRESHOLD:.0f}% in {quarter_label(next_q)}"},
+            gauge={"axis": {"range": [0, 100]}, "bar": {"color": RED if base >= 0.5 else TEAL},
+                   "steps": [{"range": [0, 40], "color": "rgba(29,158,117,0.25)"},
+                             {"range": [40, 60], "color": "rgba(227,160,8,0.25)"},
+                             {"range": [60, 100], "color": "rgba(229,72,77,0.25)"}]}))
+        fig.update_layout(height=320)
+        g1.plotly_chart(fig)
+        g1.markdown(f"**{'⚠️ At risk' if base >= 0.5 else '✅ Likely on track'}** — "
+                    f"{op} ran at **{row.cur_pct:.1f}%** in {quarter_label(latest_q)}.")
+
+        hist = pq[(pq.operator == op)].tail(16)
+        fig = px.line(hist, x="qdate", y="pct_on_time_3m", markers=True,
+                      title=f"{op}: recent quarters", labels={"qdate": "", "pct_on_time_3m": "% on time"})
+        fig.add_hline(y=THRESHOLD, line_dash="dash", line_color=AMBER)
+        fig.update_layout(height=320)
+        g2.plotly_chart(fig)
+
+        with st.expander("🎛 What-if: change the inputs and watch the risk move"):
+            st.caption("Sliders start at the real values. The model recalculates instantly.")
+            k = op.replace(" ", "_")
+            s1, s2 = st.columns(2)
+            cur_pct = s1.slider("On time this quarter %", 40.0, 100.0, float(round(row.cur_pct, 1)), 0.1, key=f"cur_{k}")
+            prev1 = s1.slider("On time last quarter %", 40.0, 100.0, float(round(row.prev1_pct, 1)), 0.1, key=f"p1_{k}")
+            prev2 = s1.slider("On time 2 quarters ago %", 40.0, 100.0, float(round(row.prev2_pct, 1)), 0.1, key=f"p2_{k}")
+            seas = s2.slider("Same quarter last year %", 40.0, 100.0, float(round(row.seasonal_pct, 1)), 0.1, key=f"se_{k}")
+            dmax = float(np.nanmax(feats["delay_per_1k_stops"]) * 1.1)
+            dpk = row.delay_per_1k_stops if pd.notna(row.delay_per_1k_stops) else medians["delay_per_1k_stops"]
+            delay = s2.slider("Delay mins per 1,000 stops", 0.0, round(dmax, 0), float(min(round(dpk, 0), dmax)), 1.0, key=f"d_{k}")
+            nr = s2.slider("Share of delay from Network Rail", 0.0, 1.0,
+                           float(round(row.nr_share if pd.notna(row.nr_share) else medians["nr_share"], 2)), 0.01, key=f"nr_{k}")
+            wx = s2.slider("Share of delay from severe weather", 0.0, 1.0,
+                           float(round(row.weather_share if pd.notna(row.weather_share) else medians["weather_share"], 2)), 0.01, key=f"wx_{k}")
+
+            w = row.copy()
+            w["cur_pct"], w["prev1_pct"], w["prev2_pct"], w["seasonal_pct"] = cur_pct, prev1, prev2, seas
+            w["roll4_pct"] = np.mean([cur_pct, prev1, prev2, seas])
+            w["delta1"] = cur_pct - prev1
+            w["delay_per_1k_stops"], w["nr_share"], w["weather_share"] = delay, nr, wx
+            risk_wi = float(predict(pd.DataFrame([w]))[0])
+            m1, m2 = st.columns(2)
+            m1.metric("Risk with real data", f"{base:.0%}")
+            m2.metric("Risk with your changes", f"{risk_wi:.0%}", f"{(risk_wi - base) * 100:+.0f} pts", delta_color="inverse")
+
+    with tab_model:
+        if metrics:
+            st.markdown(f"**Task:** {metrics['task']}.  \n"
+                        f"**Tested on future quarters only:** {metrics['test_from']} → {metrics['test_to']} "
+                        f"({metrics['test_rows']} operator-quarters, trained on data up to {metrics['train_until']}).")
+            res = pd.DataFrame(metrics["results"]).T.reset_index()
+            res.columns = ["Model", "ROC AUC", "F1", "Precision", "Recall", "Accuracy"]
+            st.dataframe(res, hide_index=True)
+            st.info("**Honest reading:** UK rail is strongly seasonal — Oct–Dec is reliably the worst quarter — so "
+                    "simple baselines like 'same quarter last year' already score very high. The model matches or "
+                    "slightly beats them. It's a sound early-warning signal, not a crystal ball.")
+            coef = pd.Series(metrics["coefficients"]).sort_values()
+            fig = px.bar(coef, orientation="h", height=460,
+                         title="What drives the prediction (standardised coefficients; + = more risk)",
+                         labels={"value": "Coefficient", "index": ""})
+            fig.update_layout(showlegend=False)
+            fig.update_traces(marker_color=BLUE)
+            st.plotly_chart(fig)
+
+
+# ═════════════════════════════ RAW DATA ══════════════════════════════════════
 elif page == "🗃 Raw Data":
     st.title("Raw Data Explorer")
-
     table = st.selectbox("Table", ["delay_causes", "operator_punctuality", "station_performance"])
-    try:
-        df_raw = pd.read_sql(f"SELECT * FROM {table} LIMIT 5000", conn)
-        st.caption(f"{len(df_raw):,} rows (capped at 5,000 for display)")
-        st.dataframe(df_raw, use_container_width=True, height=500)
-        csv = df_raw.to_csv(index=False).encode("utf-8")
-        st.download_button(f"⬇️ Download {table}.csv", csv, f"{table}.csv", "text/csv")
-    except Exception as e:
-        st.error(f"Could not load table '{table}': {e}")
+    d = _query(f"SELECT * FROM {table} LIMIT 5000")
+    st.caption(f"Showing up to 5,000 rows · {len(d.columns)} columns")
+    st.dataframe(d)
+    st.download_button(f"⬇️ Download {table}.csv (shown rows)", d.to_csv(index=False).encode("utf-8"),
+                       f"{table}.csv", "text/csv")

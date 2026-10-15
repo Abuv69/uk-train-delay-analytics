@@ -1,0 +1,57 @@
+{
+  "task": "Predict on-time % (3 min) below 80% next quarter",
+  "train_rows": 730,
+  "test_rows": 240,
+  "train_until": "Oct\u2013Dec 2022",
+  "test_from": "Apr\u2013Jun 2023",
+  "test_to": "Jul\u2013Sep 2025",
+  "at_risk_share_test": 0.458,
+  "results": {
+    "Baseline: same as this quarter": {
+      "roc_auc": 0.96,
+      "f1": 0.872,
+      "precision": 0.88,
+      "recall": 0.864,
+      "accuracy": 0.883
+    },
+    "Baseline: same quarter last year": {
+      "roc_auc": 0.986,
+      "f1": 0.924,
+      "precision": 0.904,
+      "recall": 0.945,
+      "accuracy": 0.929
+    },
+    "Logistic regression": {
+      "roc_auc": 0.992,
+      "f1": 0.926,
+      "precision": 0.884,
+      "recall": 0.973,
+      "accuracy": 0.929
+    },
+    "Random forest": {
+      "roc_auc": 0.981,
+      "f1": 0.922,
+      "precision": 0.877,
+      "recall": 0.973,
+      "accuracy": 0.925
+    }
+  },
+  "deployed_model": "Logistic regression",
+  "coefficients": {
+    "cur_pct": -2.458,
+    "prev1_pct": -1.806,
+    "prev2_pct": 0.857,
+    "seasonal_pct": -0.343,
+    "roll4_pct": -1.033,
+    "delta1": -1.234,
+    "delay_per_1k_stops": -0.106,
+    "nr_share": 0.102,
+    "weather_share": 0.1,
+    "traincrew_share": 0.064,
+    "tgt_q1": -0.181,
+    "tgt_q2": 0.817,
+    "tgt_q3": 0.931,
+    "tgt_q4": -1.564
+  },
+  "deployed_model_trained_on": 994
+}

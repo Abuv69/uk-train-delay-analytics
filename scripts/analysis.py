@@ -195,19 +195,18 @@ def chart_operator_punctuality(conn):
     ]
     placeholders = ",".join("?" * len(MAJOR))
     df = pd.read_sql(f"""
-        SELECT operator, year, quarter, pct_on_time_3m
+        SELECT operator, fin_year, quarter, qdate, pct_on_time_3m
         FROM operator_punctuality
         WHERE operator IN ({placeholders})
           AND pct_on_time_3m IS NOT NULL
-        ORDER BY operator, year, quarter
+        ORDER BY operator, qdate
     """, conn, params=MAJOR)
 
     if df.empty:
         return
 
-    df["x"] = df["year"].astype(str) + " " + df["quarter"]
-    pivot = df.pivot_table(index="x", columns="operator", values="pct_on_time_3m")
-    pivot = pivot.sort_index()
+    df["qdate"] = pd.to_datetime(df["qdate"])
+    pivot = df.pivot_table(index="qdate", columns="operator", values="pct_on_time_3m").sort_index()
 
     fig, ax = plt.subplots(figsize=(14, 6))
     palette = sns.color_palette("tab10", n_colors=len(pivot.columns))
@@ -217,12 +216,12 @@ def chart_operator_punctuality(conn):
     ax.axhline(80, color=RED, linestyle="--", linewidth=1, label="80% benchmark")
 
     # x-axis: show year labels at Q1
-    q1_idx = [i for i, v in enumerate(pivot.index) if "Q1" in v]
+    q1_idx = [i for i, d in enumerate(pivot.index) if d.month == 4]
     ax.set_xticks(q1_idx)
-    ax.set_xticklabels([pivot.index[i][:4] for i in q1_idx], fontsize=9)
+    ax.set_xticklabels([str(pivot.index[i].year) for i in q1_idx], fontsize=9)
 
     ax.set_ylabel("% Trains on time (within 3 mins)")
-    ax.set_title("Operator Punctuality — Quarterly Trend (2014–2025)", fontweight="bold")
+    ax.set_title("Operator Punctuality — Quarterly Trend", fontweight="bold")
     ax.legend(loc="lower left", fontsize=8, ncol=2)
     fig.tight_layout()
     save(fig, "5_operator_punctuality_trend.png")
