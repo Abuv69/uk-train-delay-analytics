@@ -39,7 +39,7 @@ METRICS_PATH = ROOT / "models" / "metrics.json"
 BLUE, TEAL, AMBER, RED, GREY = "#4C8BF5", "#1D9E75", "#E3A008", "#E5484D", "#8a8f98"
 AUTHOR = "Abubakar Shaikh"
 GITHUB_URL = "https://github.com/abuv69/uk-train-delay-analytics"
-LINKEDIN_URL = "linkedin.com/in/mohammedabubakarshaikh"            # paste your LinkedIn profile URL here; the button stays hidden while this is empty
+LINKEDIN_URL = "https://www.linkedin.com/in/mohammedabubakarshaikh"            # paste your LinkedIn profile URL here; the button stays hidden while this is empty
 ORR_URL = "https://dataportal.orr.gov.uk/"
 
 st.set_page_config(page_title="UK Train Delays: is my train company reliable?", page_icon="🚂",
