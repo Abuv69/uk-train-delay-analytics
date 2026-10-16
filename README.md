@@ -113,6 +113,7 @@ uk-train-delay-analytics/
 │   ├── load_to_sql.py          ← Loads CSVs → SQLite
 │   ├── analysis.py             ← Generates 6 charts
 │   ├── features.py             ← Shared feature builder (training + dashboard)
+│   ├── insights.py             ← All dashboard calculations and sentences (unit-tested)
 │   └── ml_model.py             ← Trains and evaluates the risk model
 ├── lambda/
 │   ├── lambda_function.py      ← AWS Lambda handler
@@ -196,22 +197,40 @@ After deploy, any new ORR file uploaded to `s3://your-bucket/raw/` automatically
 
 **Question:** given a full quarter of data, will an operator's on-time % (within 3 min) fall **below 80%** next quarter?
 
-**Features:** the last four quarters of punctuality (including the current quarter), momentum, delay minutes per 1,000 stops, the share of delay from Network Rail / weather / traincrew, and which quarter is being predicted.
-
-**Evaluation (done properly):** trained on data up to Oct–Dec 2022, tested only on **future** quarters (Apr 2023 – Sep 2025, 240 operator-quarters), with a one-quarter gap so no labels leak.
+**Evaluation:** trained on data up to Oct–Dec 2022, tested only on **future** quarters (Apr–Jun 2023 to Jul–Sep 2025, 240 operator-quarters) with a one-quarter gap so no labels leak.
 
 | Model | ROC AUC | F1 | Precision | Recall |
 |---|---|---|---|---|
 | Baseline: same as this quarter | 0.960 | 0.872 | 0.88 | 0.86 |
 | Baseline: same quarter last year | 0.986 | 0.924 | 0.90 | 0.94 |
 | Random forest | 0.981 | 0.922 | 0.88 | 0.97 |
-| **Logistic regression (deployed)** | 0.992 | 0.926 | 0.88 | 0.97 |
+| **Logistic regression (deployed)** | 0.991 | 0.942 | 0.93 | 0.95 |
 
-**Honest reading:** rail punctuality is so seasonal that the simple baseline "same quarter last year" is already very strong. The model matches or slightly beats it, so it is a useful early-warning signal rather than a breakthrough. Probabilities are not calibrated and should be read as a ranking of risk, not exact odds.
+**Honest reading:** rail punctuality is so seasonal that "same quarter last year" is already a strong baseline. The model matches or slightly beats it, so it is an early-warning signal rather than a breakthrough.
 
-The dashboard's **Risk Predictor** page fills itself from the latest real data, ranks every operator, and has a what-if panel to test changes.
+**Overconfidence check:** the first version gave extreme forecasts (under 2% or over 98%) for 48% of test cases. Those were mostly right in testing, but 240 correlated cases cannot prove certainty. I re-tuned the regularisation on past data only (extremes now 12%), cap displayed forecasts at 5–95%, and show past accuracy next to every forecast. The trade-off is mild under-confidence in the middle ranges (documented in the app).
 
 ![Model results](visuals/7_ml_model_results.png)
+
+---
+
+## 🧭 Design principles (v4)
+
+The app is built for a commuter with no data background:
+- **One question, one answer:** pick an operator (optional station, quarter) and get a traffic-light answer card with words, not just colour.
+- **Every change is explained:** a plain-English "What changed" line, a "Why this number?" panel (source, period, method) and, for forecasts, a confidence level with past accuracy.
+- **Nothing silently dropped or filled in:** missing data gets an explicit reason; cleaning exclusions are listed on the *Data and method* page.
+- **Shareable:** selections live in the URL, so a result can be re-opened identically.
+- **Calculations are separate from the UI** (`scripts/insights.py`) so they can be unit-tested.
+
+## ✅ Tests
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests -q
+```
+
+58 tests: hand-checked unit tests for every calculation (on-time %, quarter-on-quarter change, cause shares, forecast features), calibration guards for the model, and end-to-end tests that drive the running app and check the "What changed" text against numbers computed independently from the database. They run on every push via GitHub Actions.
 
 ---
 

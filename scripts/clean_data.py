@@ -12,6 +12,8 @@ RAW = ROOT / "data" / "raw"
 OUT = ROOT / "data" / "processed"
 OUT.mkdir(parents=True, exist_ok=True)
 
+LOG = {}   # what cleaning set aside or changed (shown on the dashboard's Data and method page)
+
 # ──────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────
@@ -178,6 +180,8 @@ def clean_3130():
     df["year_label"] = df["period"].astype(str).str.extract(r"(Apr \d{4} to Mar \d{4})")
     df["period_num"] = df["period"].astype(str).str.extract(r"Period\s+(\d+)").astype(float)
 
+    LOG["station_rows_with_no_3min_figure"] = int(df["time_to_3_pct"].isna().sum()) if "time_to_3_pct" in df.columns else None
+    LOG["station_rows_total"] = int(len(df))
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]   # empty junk columns
     df["station"] = (df["station"].astype(str)
                      .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
@@ -278,6 +282,8 @@ def clean_3133():
 
     # ── Fixes (found while reviewing the live dashboard) ──────────────────
     # 1. strip ORR footnote markers: "Lumo [note 3]" -> "Lumo"
+    LOG["punctuality_operator_names_with_footnote_tags_cleaned"] = int(
+        df["operator"].astype(str).str.contains(r"\[note", regex=True).sum())
     df["operator"] = (df["operator"].astype(str)
                       .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
     # 2. provisional flag, then clean the period label ("Oct to Dec 2025 [p]")
@@ -286,7 +292,10 @@ def clean_3133():
                     .str.replace(r"\s*\[\w+\]", "", regex=True).str.strip())
     # 3. zero recorded stops = no service (e.g. Hull Trains in COVID), not 0% punctuality
     if "recorded_stops" in df.columns:
-        df = df[df["recorded_stops"].fillna(0) > 0]
+        zero = df["recorded_stops"].fillna(0) <= 0
+        LOG["punctuality_quarters_excluded_no_trains_recorded"] = [
+            f"{r.operator} ({r.period})" for r in df[zero].itertuples()]
+        df = df[~zero]
     # 4. real quarter start date -> chronological sorting (Jan-Mar belongs to the PREVIOUS
     #    financial year, so sorting by calendar year + Q label mis-orders quarters)
     first_month = {"Q1": 4, "Q2": 7, "Q3": 10, "Q4": 1}
@@ -296,7 +305,10 @@ def clean_3133():
     keep = [c for c in ["period", "operator", "recorded_stops", "pct_on_time_1m",
                         "pct_on_time_3m", "pct_on_time_15m", "quarter", "year",
                         "fin_year", "qdate", "provisional"] if c in df.columns]
+    before = len(df)
     df = df[keep].drop_duplicates(["operator", "period"], keep="last")
+    LOG["punctuality_duplicate_rows_removed"] = int(before - len(df))
+    LOG["punctuality_rows_with_no_3min_figure"] = int(df["pct_on_time_3m"].isna().sum())
 
     out = OUT / "operator_punctuality.csv"
     df.to_csv(out, index=False)
@@ -320,4 +332,6 @@ if __name__ == "__main__":
     clean_3184()
     clean_3130()
     clean_3133()
+    import json
+    (OUT / "cleaning_log.json").write_text(json.dumps(LOG, indent=2))
     print("\n✓ All done. Cleaned files saved to data/processed/")

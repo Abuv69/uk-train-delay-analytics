@@ -71,6 +71,18 @@ def load():
     """)
 
     conn.commit()
+
+    # build info: shown in the app as "data last updated" + what cleaning set aside
+    import json
+    from datetime import datetime, timezone
+    info = {"built_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "latest_punctuality_quarter_start": str(pd.read_sql(
+                "SELECT MAX(qdate) m FROM operator_punctuality", conn)["m"].iloc[0])[:10],
+            "latest_delay_financial_year": pd.read_sql(
+                "SELECT MAX(year_label) m FROM delay_causes", conn)["m"].iloc[0]}
+    log_path = PROCESSED / "cleaning_log.json"
+    info["cleaning"] = json.loads(log_path.read_text()) if log_path.exists() else {}
+    (DB_DIR / "build_info.json").write_text(json.dumps(info, indent=2))
     conn.close()
     print(f"\n✓ Database ready at {DB_PATH.relative_to(ROOT)}")
 
