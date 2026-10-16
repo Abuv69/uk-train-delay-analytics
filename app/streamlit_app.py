@@ -47,7 +47,7 @@ st.set_page_config(page_title="UK Train Delays: is my train company reliable?", 
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; max-width: 1100px;}
+.block-container {padding-top: 4.5rem; max-width: 1100px;}
 div[data-baseweb="select"] > div {min-height: 48px;}
 .stButton > button, .stDownloadButton > button, .stLinkButton > a {min-height: 48px; width: 100%;}
 .answer {padding: 1.1rem 1.3rem; border-radius: 16px; margin: .6rem 0 1rem;
