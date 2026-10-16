@@ -2,6 +2,8 @@
 
 > **Production-style data pipeline** — Official ORR data · AWS S3 · AWS Lambda · Python · Machine Learning · Streamlit Dashboard
 
+**🔗 Live demo:** https://uk-train-delay-analytics-abu.streamlit.app/
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://python.org)
 [![AWS S3](https://img.shields.io/badge/AWS-S3-orange?logo=amazons3)](https://aws.amazon.com/s3/)
 [![AWS Lambda](https://img.shields.io/badge/AWS-Lambda-orange?logo=awslambda)](https://aws.amazon.com/lambda/)
