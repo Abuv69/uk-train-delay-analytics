@@ -39,10 +39,33 @@ def to_num(val):
         return float("nan")
 
 
+def _tolerate_ods_errors():
+    """ORR .ods files contain error cells that pandas rejects; treat them as missing."""
+    try:
+        from pandas.io.excel import _odfreader as _odf
+        if getattr(_odf.ODFReader, "_patched", False):
+            return
+        orig = _odf.ODFReader._get_cell_value
+        def safe(self, cell):
+            try:
+                return orig(self, cell)
+            except ValueError:
+                return float("nan")
+        _odf.ODFReader._get_cell_value = safe
+        _odf.ODFReader._patched = True
+    except Exception:
+        pass
+
+
 def stream_excel(bucket, key, engine="openpyxl", **kwargs):
     """Read an Excel/ODS file from S3 directly into a DataFrame."""
+    _tolerate_ods_errors()
     obj = s3.get_object(Bucket=bucket, Key=key)
     buf = io.BytesIO(obj["Body"].read())
+    if kwargs.get("sheet_name") in ("3130a Stations",):
+        names = pd.ExcelFile(buf, engine=engine).sheet_names
+        kwargs["sheet_name"] = next(n for n in names if n.lower().replace("_", " ").startswith("3130a"))
+        buf.seek(0)
     return pd.read_excel(buf, engine=engine, **kwargs)
 
 
@@ -85,12 +108,17 @@ def parse_period_3184(raw_period: str):
 
 def clean_3184(bucket, key):
     logger.info("Cleaning Table 3184 ...")
-    import openpyxl
     obj = s3.get_object(Bucket=bucket, Key=key)
-    wb = openpyxl.load_workbook(io.BytesIO(obj["Body"].read()), read_only=True)
-    ws = wb["Sheet 1"]
+    body = obj["Body"].read()
+    if key.lower().endswith(".csv"):
+        d = pd.read_csv(io.BytesIO(body), header=0)
+        rows = [tuple(d.columns)] + [tuple(r) for r in d.itertuples(index=False)]
+    else:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(body), read_only=True)
+        rows = list(wb["Sheet 1"].iter_rows(values_only=True))
     records = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
+    for i, row in enumerate(rows):
         if i == 0 or not row[0] or not row[1]:
             continue
         year_label, period_num, start_year = parse_period_3184(str(row[0]))
@@ -191,7 +219,8 @@ def clean_3133(bucket, key):
 
 def clean_3130(bucket, key):
     logger.info("Cleaning Table 3130 (large file — may take ~30s) ...")
-    df_raw = stream_excel(bucket, key, engine="openpyxl",
+    eng = "odf" if key.lower().endswith(".ods") else "openpyxl"
+    df_raw = stream_excel(bucket, key, engine=eng,
                           sheet_name="3130a Stations", header=None)
     header_row = None
     for idx, row in df_raw.iterrows():
@@ -201,7 +230,7 @@ def clean_3130(bucket, key):
     if header_row is None:
         raise ValueError("Could not find header in Table 3130")
 
-    df = stream_excel(bucket, key, engine="openpyxl",
+    df = stream_excel(bucket, key, engine=eng,
                       sheet_name="3130a Stations", header=header_row)
     df.columns = [str(c).strip() for c in df.columns]
 

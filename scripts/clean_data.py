@@ -33,6 +33,21 @@ def to_num(val):
         return float("nan")
 
 
+# Some ORR .ods files contain spreadsheet error cells that pandas' ODF reader rejects.
+# Treat them as missing values instead of crashing.
+try:
+    from pandas.io.excel import _odfreader as _odf
+    _orig_cell = _odf.ODFReader._get_cell_value
+    def _safe_cell(self, cell):
+        try:
+            return _orig_cell(self, cell)
+        except ValueError:
+            return float("nan")
+    _odf.ODFReader._get_cell_value = _safe_cell
+except Exception:
+    pass
+
+
 def parse_period_3184(raw_period: str):
     """
     '   Apr 2019 to Mar 2020 (Period 01)'  ->  year_label='2019-20', period_num=1
@@ -82,6 +97,9 @@ def clean_3184():
         for row in ws.iter_rows(values_only=True):
             wb_rows.append(row)
         wb.close()
+    elif path.suffix == ".csv":
+        df_raw = pd.read_csv(path, header=0)
+        wb_rows = [tuple(df_raw.columns)] + [tuple(r) for r in df_raw.itertuples(index=False)]
     else:
         df_raw = pd.read_excel(path, engine="odf", header=0)
         wb_rows = [tuple(df_raw.columns)] + [tuple(r) for r in df_raw.itertuples(index=False)]
@@ -128,11 +146,11 @@ def clean_3130():
     path = candidates[0]
     print(f"[3130] Reading {path.name} (this is large, may take ~30s) ...")
 
-    sheet = "3130a Stations"
-    if path.suffix == ".xlsx":
-        df_raw = pd.read_excel(path, sheet_name=sheet, header=None)
-    else:
-        df_raw = pd.read_excel(path, engine="odf", sheet_name=sheet, header=None)
+    engine3130 = "openpyxl" if path.suffix == ".xlsx" else "odf"
+    xl = pd.ExcelFile(path, engine=engine3130)
+    sheet = next(n for n in xl.sheet_names
+                 if n.lower().replace("_", " ").startswith("3130a"))
+    df_raw = xl.parse(sheet, header=None)
 
     # Find the actual header row (contains 'Time period')
     header_row = None
@@ -145,7 +163,8 @@ def clean_3130():
         print("[3130] Could not find header row — skipping.")
         return
 
-    df = pd.read_excel(path, sheet_name=sheet, header=header_row, engine="openpyxl" if path.suffix == ".xlsx" else "odf")
+    df = df_raw.iloc[header_row + 1:].copy()
+    df.columns = df_raw.iloc[header_row].tolist()
     df.columns = [str(c).strip() for c in df.columns]
 
     # Rename columns

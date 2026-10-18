@@ -1,39 +1,39 @@
 {
   "task": "Predict on-time % (3 min) below 80% next quarter",
   "train_rows": 730,
-  "test_rows": 240,
+  "test_rows": 288,
   "train_until": "Oct\u2013Dec 2022",
   "test_from": "Apr\u2013Jun 2023",
-  "test_to": "Jul\u2013Sep 2025",
-  "at_risk_share_test": 0.458,
+  "test_to": "Jan\u2013Mar 2026",
+  "at_risk_share_test": 0.448,
   "results": {
     "Baseline: same as this quarter": {
       "roc_auc": 0.96,
-      "f1": 0.872,
-      "precision": 0.88,
-      "recall": 0.864,
-      "accuracy": 0.883
+      "f1": 0.873,
+      "precision": 0.869,
+      "recall": 0.876,
+      "accuracy": 0.885
     },
     "Baseline: same quarter last year": {
-      "roc_auc": 0.986,
-      "f1": 0.924,
-      "precision": 0.904,
-      "recall": 0.945,
-      "accuracy": 0.929
+      "roc_auc": 0.988,
+      "f1": 0.931,
+      "precision": 0.917,
+      "recall": 0.946,
+      "accuracy": 0.938
     },
     "Random forest": {
-      "roc_auc": 0.981,
-      "f1": 0.922,
-      "precision": 0.877,
-      "recall": 0.973,
-      "accuracy": 0.925
+      "roc_auc": 0.982,
+      "f1": 0.912,
+      "precision": 0.867,
+      "recall": 0.961,
+      "accuracy": 0.917
     },
     "Logistic regression (deployed)": {
       "roc_auc": 0.991,
-      "f1": 0.942,
-      "precision": 0.929,
-      "recall": 0.955,
-      "accuracy": 0.946
+      "f1": 0.935,
+      "precision": 0.924,
+      "recall": 0.946,
+      "accuracy": 0.941
     }
   },
   "deployed_model": "Logistic regression, C=0.03, no class weights",
@@ -44,10 +44,10 @@
     "seasonal_pct": -0.302,
     "roll4_pct": -0.543,
     "delta1": -0.512,
-    "delay_per_1k_stops": 0.055,
-    "nr_share": 0.018,
+    "delay_per_1k_stops": 0.057,
+    "nr_share": 0.025,
     "weather_share": -0.055,
-    "traincrew_share": 0.071,
+    "traincrew_share": 0.075,
     "tgt_q1": -0.115,
     "tgt_q2": 0.113,
     "tgt_q3": 0.399,
@@ -55,63 +55,63 @@
   },
   "calibration": {
     "previous_balanced_C1": {
-      "brier": 0.0435,
-      "log_loss": 0.1458,
-      "ece": 0.0543,
-      "share_extreme_forecasts": 0.483
+      "brier": 0.043,
+      "log_loss": 0.1424,
+      "ece": 0.0479,
+      "share_extreme_forecasts": 0.497
     },
     "deployed_unweighted_tunedC": {
-      "brier": 0.051,
-      "log_loss": 0.1962,
-      "ece": 0.0853,
+      "brier": 0.0497,
+      "log_loss": 0.1918,
+      "ece": 0.0815,
       "share_extreme_forecasts": 0.125
     },
     "chosen_C": 0.03,
     "cv_log_loss_by_C": {
-      "0.01": 0.3792,
-      "0.03": 0.3626,
-      "0.1": 0.3768,
-      "0.3": 0.4036,
-      "1.0": 0.4337,
-      "3.0": 0.4551
+      "0.01": 0.379,
+      "0.03": 0.3616,
+      "0.1": 0.3741,
+      "0.3": 0.3985,
+      "1.0": 0.4262,
+      "3.0": 0.446
     }
   },
   "calibration_bands": [
     {
       "lo": 0.0,
       "hi": 0.1,
-      "n": 68,
-      "mean_predicted": 0.043,
+      "n": 86,
+      "mean_predicted": 0.041,
       "actual_rate": 0.0
     },
     {
       "lo": 0.1,
       "hi": 0.3,
-      "n": 40,
-      "mean_predicted": 0.166,
-      "actual_rate": 0.0
+      "n": 50,
+      "mean_predicted": 0.168,
+      "actual_rate": 0.02
     },
     {
       "lo": 0.3,
       "hi": 0.7,
-      "n": 43,
-      "mean_predicted": 0.49,
-      "actual_rate": 0.512
+      "n": 46,
+      "mean_predicted": 0.489,
+      "actual_rate": 0.5
     },
     {
       "lo": 0.7,
       "hi": 0.9,
-      "n": 37,
+      "n": 46,
       "mean_predicted": 0.818,
-      "actual_rate": 0.973
+      "actual_rate": 0.978
     },
     {
       "lo": 0.9,
       "hi": 1.0,
-      "n": 52,
-      "mean_predicted": 0.963,
+      "n": 60,
+      "mean_predicted": 0.961,
       "actual_rate": 1.0
     }
   ],
-  "deployed_model_trained_on": 994
+  "deployed_model_trained_on": 1042
 }

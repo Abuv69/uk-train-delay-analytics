@@ -1,11 +1,11 @@
 {
-  "built_at_utc": "2026-10-16 11:00",
-  "latest_punctuality_quarter_start": "2025-10-01",
-  "latest_delay_financial_year": "2025-26",
+  "built_at_utc": "2026-10-17 23:24",
+  "latest_punctuality_quarter_start": "2026-04-01",
+  "latest_delay_financial_year": "2026-27",
   "cleaning": {
-    "station_rows_with_no_3min_figure": 10575,
-    "station_rows_total": 101205,
-    "punctuality_operator_names_with_footnote_tags_cleaned": 12,
+    "station_rows_with_no_3min_figure": 12110,
+    "station_rows_total": 116955,
+    "punctuality_operator_names_with_footnote_tags_cleaned": 14,
     "punctuality_quarters_excluded_no_trains_recorded": [
       "Hull Trains (Apr to Jun 2020)"
     ],
