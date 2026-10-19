@@ -465,7 +465,7 @@ def card_causes(op):
         fy = own.year_label.max()
         sh = ins.cause_group_shares(dc, op, fy)
         y0 = int(fy[:4])
-        span = f"April {y0} to March {y0 + 1}"
+        span = fy_span(fy)
         top = sh.iloc[0]
         st.markdown(f"In **{fy}** ({span}), {esc(op)} lost **{sh.minutes.sum():,.0f} minutes** to delays. The biggest cause (**{top.share:.0%}** of the "
                     f"minutes) was: **{top.group}**.")
@@ -511,10 +511,20 @@ def card_seasons(op, season_q):
 
 
 # ══════════════════════════════ WHY TRAINS ARE LATE ══════════════════════════
+def fy_span(fy):
+    """'April 2025 to March 2026' for a full year; a part year says where the data really ends."""
+    y0 = int(fy[:4])
+    last = int(dc[dc.year_label == fy].period_num.max())
+    if last >= 13:
+        return f"April {y0} to March {y0 + 1}"
+    end = pd.Timestamp(y0, 4, 1) + pd.Timedelta(days=28 * last)
+    return f"April {y0} to about {end:%B %Y}, part year"
+
+
 def period_text(fy):
     if fy == "All years":
-        return f"April {int(dc.year_label.min()[:4])} to March {int(dc.year_label.max()[:4]) + 1}"
-    return f"April {int(fy[:4])} to March {int(fy[:4]) + 1}"
+        return f"April {int(dc.year_label.min()[:4])} to " + fy_span(dc.year_label.max()).split(" to ", 1)[1]
+    return fy_span(fy)
 
 
 def page_late():
