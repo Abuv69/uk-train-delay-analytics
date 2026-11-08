@@ -10,7 +10,6 @@ import html
 import json
 import logging
 import os
-import sqlite3
 import sys
 from contextlib import closing
 from pathlib import Path
@@ -24,6 +23,7 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from scripts import db  # noqa: E402
 from scripts import insights as ins  # noqa: E402
 from scripts.features import (FEATURES, THRESHOLD, build_feature_table,  # noqa: E402
                               next_quarter_start, quarter_label)
@@ -94,14 +94,20 @@ def show(fig, height=None):
 
 
 # ── data ──────────────────────────────────────────────────────────────────────
-if not DB_PATH.exists():
+try:                                   # Streamlit Cloud / ECS can pass the database address as a secret
+    if "DATABASE_URL" in st.secrets and not os.environ.get("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
+except Exception:
+    pass
+
+if not db.is_postgres() and not DB_PATH.exists():
     st.error("The data file is missing. Run `python scripts/load_to_sql.py` first.")
     st.stop()
 
 
 @st.cache_data(show_spinner="Loading the latest rail data…")
 def load_data():
-    with closing(sqlite3.connect(DB_PATH.as_posix())) as conn:
+    with closing(db.connect()) as conn:
         pq = pd.read_sql("SELECT * FROM operator_punctuality WHERE pct_on_time_3m IS NOT NULL", conn,
                          parse_dates=["qdate"])
         dc = pd.read_sql("SELECT * FROM delay_causes", conn)
@@ -137,12 +143,25 @@ def station_summary():
 
 @st.cache_data
 def csv_bytes(table):
-    with closing(sqlite3.connect(DB_PATH.as_posix())) as conn:
+    with closing(db.connect()) as conn:
         return pd.read_sql(f"SELECT * FROM {table}", conn).to_csv(index=False).encode("utf-8")
 
 
 pq, dc, stn, feats = load_data()
-bundle, metrics, info = load_bundle(), load_json(METRICS_PATH), load_json(INFO_PATH)
+def load_info():
+    """'Data last updated' details: from the database when it holds them, else from the repo file."""
+    if db.is_postgres():
+        try:
+            with closing(db.connect()) as conn:
+                row = conn.execute(db.text("SELECT info FROM build_info")).first()
+            if row:
+                return json.loads(row[0])
+        except Exception:
+            log.exception("could not read build_info from the database")
+    return load_json(INFO_PATH)
+
+
+bundle, metrics, info = load_bundle(), load_json(METRICS_PATH), load_info()
 latest_q = pq["qdate"].max()
 next_q = next_quarter_start(latest_q)
 L_LATEST, L_NEXT = quarter_label(latest_q), quarter_label(next_q)
@@ -1020,7 +1039,7 @@ def page_download():
             "station_performance": "On-time and cancellation figures by station and 4-week period (ORR Table 3130)."}
     table = st.selectbox("Which table?", list(desc))
     st.caption(desc[table])
-    with closing(sqlite3.connect(DB_PATH.as_posix())) as conn:
+    with closing(db.connect()) as conn:
         n = pd.read_sql(f"SELECT COUNT(*) n FROM {table}", conn)["n"].iloc[0]
         prev = pd.read_sql(f"SELECT * FROM {table} LIMIT 500", conn)
     st.caption(f"Preview of the first 500 of {n:,} rows. The download contains all {n:,} rows.")

@@ -1,9 +1,8 @@
 # scripts/analysis.py
-# Generates 6 analytical charts from the SQLite database.
+# Generates 6 analytical charts from the database (SQLite, or PostgreSQL when DATABASE_URL is set).
 # Run from the project root: python scripts/analysis.py
 
 from pathlib import Path
-import sqlite3
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -11,6 +10,8 @@ import seaborn as sns
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from scripts import db  # noqa: E402
 DB_PATH = ROOT / "database" / "delays.db"
 VIS_DIR = ROOT / "visuals"
 
@@ -24,11 +25,11 @@ GRAY   = "#73726c"
 
 
 def get_conn():
-    if not DB_PATH.exists():
+    if not db.is_postgres() and not DB_PATH.exists():
         print(f"[ERROR] Database not found at {DB_PATH.relative_to(ROOT)}")
         print("Run scripts/load_to_sql.py first.")
         sys.exit(1)
-    return sqlite3.connect(DB_PATH.as_posix())
+    return db.connect()
 
 
 def save(fig, name):
@@ -193,14 +194,14 @@ def chart_operator_punctuality(conn):
         "London North Eastern Railway", "Northern Trains", "ScotRail",
         "South Western Railway", "TransPennine Express",
     ]
-    placeholders = ",".join("?" * len(MAJOR))
-    df = pd.read_sql(f"""
+    placeholders = ",".join(f":op{i}" for i in range(len(MAJOR)))
+    df = pd.read_sql(db.text(f"""
         SELECT operator, fin_year, quarter, qdate, pct_on_time_3m
         FROM operator_punctuality
         WHERE operator IN ({placeholders})
           AND pct_on_time_3m IS NOT NULL
         ORDER BY operator, qdate
-    """, conn, params=MAJOR)
+    """), conn, params={f"op{i}": m for i, m in enumerate(MAJOR)})
 
     if df.empty:
         return

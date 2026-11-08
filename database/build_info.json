@@ -1,5 +1,6 @@
 {
-  "built_at_utc": "2026-10-17 23:24",
+  "built_at_utc": "2026-11-06 10:02",
+  "database": "postgresql",
   "latest_punctuality_quarter_start": "2026-04-01",
   "latest_delay_financial_year": "2026-27",
   "cleaning": {
@@ -11,5 +12,10 @@
     ],
     "punctuality_duplicate_rows_removed": 0,
     "punctuality_rows_with_no_3min_figure": 0
+  },
+  "quality": {
+    "checks": 32,
+    "errors": 0,
+    "warnings": 0
   }
 }

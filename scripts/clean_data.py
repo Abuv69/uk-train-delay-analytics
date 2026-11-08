@@ -202,6 +202,7 @@ def clean_3130():
     LOG["station_rows_with_no_3min_figure"] = int(df["time_to_3_pct"].isna().sum()) if "time_to_3_pct" in df.columns else None
     LOG["station_rows_total"] = int(len(df))
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]   # empty junk columns
+    df = df.loc[:, df.columns.astype(str).str.lower() != "nan"]          # blank header cells from .ods files
     df["station"] = (df["station"].astype(str)
                      .str.replace(r"\s*\[note\s*\d+\]", "", regex=True).str.strip())
 

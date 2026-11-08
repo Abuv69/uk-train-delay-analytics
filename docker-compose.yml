@@ -1,0 +1,56 @@
+# Local, production-style stack:  PostgreSQL  +  pipeline job  +  Streamlit dashboard
+#
+#   docker compose up -d db                  # 1. start PostgreSQL
+#   docker compose run --rm pipeline         # 2. clean raw files, check quality, load, retrain
+#   docker compose up app                    # 3. dashboard at http://localhost:8501
+#
+# Put the three ORR files in data/raw/ first. Nothing here is secret: the default password
+# is for your own laptop only. For anything shared, set POSTGRES_PASSWORD in a .env file.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trains
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trains_local_only}
+      POSTGRES_DB: traindelays
+    ports:
+      - "127.0.0.1:5432:5432"        # reachable from this computer only
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trains -d traindelays"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pipeline:
+    build: .
+    profiles: ["pipeline"]            # only runs when you ask for it
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://trains:${POSTGRES_PASSWORD:-trains_local_only}@db:5432/traindelays
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./visuals:/app/visuals
+      - ./database:/app/database
+    command: python scripts/run_pipeline.py
+    user: "0:0"                       # so it can write into the mounted folders on any host OS
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://trains:${POSTGRES_PASSWORD:-trains_local_only}@db:5432/traindelays
+    volumes:
+      - ./models:/app/models:ro
+    ports:
+      - "8501:8501"
+
+volumes:
+  pgdata:

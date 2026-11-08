@@ -26,6 +26,21 @@ End-to-end data engineering pipeline that ingests **official UK rail performance
 
 ---
 
+
+## V2: PostgreSQL, Docker and data-quality checks
+
+The pipeline now loads into **PostgreSQL** (Docker locally, or AWS RDS) as a single all-or-nothing transaction,
+after **32 automated data-quality checks** that block bad data. The same code still runs on SQLite (set no
+`DATABASE_URL`), which is how the free Streamlit Community Cloud demo runs.
+
+```
+docker compose up -d db
+docker compose run --rm pipeline     # clean -> check -> load -> retrain
+docker compose up app                # http://localhost:8501
+```
+
+Full guide, including the AWS RDS steps and why the public demo reads a snapshot: [docs/V2_SETUP.md](docs/V2_SETUP.md).
+
 ## 🏗 Architecture (V1)
 
 ```

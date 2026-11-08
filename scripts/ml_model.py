@@ -11,7 +11,6 @@
 # Run from the project root: python scripts/ml_model.py
 
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -28,6 +27,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from scripts import db  # noqa: E402
 from scripts.features import (CORE, FEATURES, THRESHOLD, build_feature_table,  # noqa: E402
                               quarter_label)
 
@@ -103,10 +103,10 @@ def pick_C(lab):
 
 
 def main():
-    if not DB_PATH.exists():
+    if not db.is_postgres() and not DB_PATH.exists():
         print("[ERROR] Database not found. Run load_to_sql.py first.")
         sys.exit(1)
-    conn = sqlite3.connect(DB_PATH.as_posix())
+    conn = db.connect()
     df = build_feature_table(conn)
     conn.close()
 
